@@ -12,6 +12,9 @@ Full benchmark across tasks, modes, and seeds:
 The benchmark runs every (task, mode, seed) combination and prints a summary table at the end.
 """
 
+import os
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # suppress TF C++ info at SB3 import time
+
 import argparse
 import importlib.util
 import itertools
