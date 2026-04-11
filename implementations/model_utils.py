@@ -1,0 +1,177 @@
+"""Shared helpers for model implementations used by train.py."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import gymnasium
+import numpy as np
+import PyFlyt.gym_envs  # noqa: F401
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+
+
+def _load_scripts_module(module_name: str):
+    module_path = SCRIPTS_DIR / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(f"scripts_{module_name}", module_path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Could not import script module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+get_env_kwargs = _load_scripts_module("env_config").get_env_kwargs
+FlattenWaypointEnv = _load_scripts_module("wrappers").FlattenWaypointEnv
+
+
+TASK_EPISODE_LIMITS = {
+    "hover": 500,
+    "waypoints": 2000,
+}
+
+
+def create_env(task: str, flight_mode: int, render: bool = False):
+    """Create the PyFlyt environment used by training and evaluation."""
+    render_mode = "human" if render else None
+
+    if task == "hover":
+        return gymnasium.make(
+            "PyFlyt/QuadX-Hover-v4",
+            flight_mode=flight_mode,
+            render_mode=render_mode,
+        )
+
+    if task == "waypoints":
+        env_base = gymnasium.make(
+            "PyFlyt/QuadX-Waypoints-v4",
+            flight_mode=flight_mode,
+            render_mode=render_mode,
+            **get_env_kwargs("waypoints"),
+        )
+        return FlattenWaypointEnv(env_base, max_waypoints=4)
+
+    raise ValueError(f"Unknown task: {task}")
+
+
+def save_json(path: Path, payload: dict):
+    """Write JSON with UTF-8 encoding."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def init_wandb_run(enabled: bool, **kwargs):
+    """Initialize a W&B run only when logging is enabled."""
+    if not enabled:
+        return None
+    import wandb
+
+    return wandb.init(**kwargs)
+
+
+def log_wandb(enabled: bool, payload: dict, step=None):
+    """Log metrics to W&B when enabled."""
+    if not enabled:
+        return
+    import wandb
+
+    if step is None:
+        wandb.log(payload)
+    else:
+        wandb.log(payload, step=step)
+
+
+def finish_wandb(enabled: bool, summary=None):
+    """Finish a W&B run when enabled."""
+    if not enabled:
+        return
+    import wandb
+
+    if summary is not None:
+        wandb.log(summary)
+    wandb.finish()
+
+
+def load_artifact_metadata(artifact_dir) -> dict:
+    """Load model_info.json from an artifact directory when available."""
+    info_path = Path(artifact_dir) / "model_info.json"
+    if not info_path.exists():
+        return {}
+    with open(info_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_checkpoint_path(artifact_dir, metadata=None, default_name="checkpoint.pt", prefer_best=True) -> Path:
+    """Return the checkpoint file inside an artifact directory."""
+    path = Path(artifact_dir)
+    metadata = metadata or {}
+    best_checkpoint = path / "best_checkpoint.pt"
+    if prefer_best and best_checkpoint.exists():
+        return best_checkpoint
+    return path / metadata.get("checkpoint_file", default_name)
+
+
+def force_flight_mode(flight_mode: int):
+    """Patch gymnasium.make so evaluate.py creates the environment with the saved mode."""
+    original_make = gymnasium.make
+
+    def patched_make(env_id, *args, **kwargs):
+        kwargs["flight_mode"] = flight_mode
+        return original_make(env_id, *args, **kwargs)
+
+    gymnasium.make = patched_make
+
+
+class ObservationCheckedModel:
+    """Wrap a model and fail early when the observation dimension is wrong."""
+
+    def __init__(self, model, expected_obs_dim=None, task=None):
+        self.model = model
+        self.expected_obs_dim = expected_obs_dim
+        self.task = task
+
+    def predict(self, obs, deterministic=True):
+        if self.expected_obs_dim is not None:
+            observed_dim = int(np.asarray(obs).shape[-1])
+            if observed_dim != self.expected_obs_dim:
+                task_hint = f" trained for '{self.task}'" if self.task else ""
+                raise ValueError(
+                    f"Observation size mismatch: got {observed_dim}, expected {self.expected_obs_dim}. "
+                    f"This checkpoint was{task_hint}. "
+                    "Use the generated results/models/*.py file that matches the environment."
+                )
+        return self.model.predict(obs, deterministic=deterministic)
+
+
+def evaluate_policy(model, env, max_episode_length, n_episodes=5, deterministic=True):
+    """Run a few episodes and return compact evaluation statistics."""
+    rewards = []
+    lengths = []
+
+    for episode_idx in range(n_episodes):
+        obs, _ = env.reset(seed=100 + episode_idx)
+        total_reward = 0.0
+        steps = 0
+        done = False
+
+        while not done and steps < max_episode_length:
+            action, _ = model.predict(obs, deterministic=deterministic)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            steps += 1
+            done = terminated or truncated
+
+        rewards.append(float(total_reward))
+        lengths.append(int(steps))
+
+    return {
+        "mean_reward": float(np.mean(rewards)),
+        "std_reward": float(np.std(rewards)),
+        "mean_length": float(np.mean(lengths)),
+    }
