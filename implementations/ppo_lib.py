@@ -45,9 +45,6 @@ def train_model(task, flight_mode, seed, num_timesteps, log_to_wandb, output_dir
         config={
             "algorithm": ALGORITHM_NAME,
             "task": task,
-            "flight_mode": flight_mode,
-            "seed": seed,
-            "num_timesteps": num_timesteps,
             "library": "stable-baselines3",
         },
         tags=[ALGORITHM_NAME, task, f"mode_{flight_mode}"],

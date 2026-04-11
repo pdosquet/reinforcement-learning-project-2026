@@ -65,9 +65,6 @@ def train_model(task, flight_mode, seed, num_timesteps, log_to_wandb, output_dir
         config={
             "algorithm": ALGORITHM_NAME,
             "task": task,
-            "flight_mode": flight_mode,
-            "seed": seed,
-            "num_timesteps": num_timesteps,
         },
         tags=[ALGORITHM_NAME, task, f"mode_{flight_mode}"],
         sync_tensorboard=False,
@@ -92,8 +89,7 @@ def train_model(task, flight_mode, seed, num_timesteps, log_to_wandb, output_dir
             "eval_reward_mean": stats["mean_reward"],
             "eval_reward_std": stats["std_reward"],
         }
-        log_wandb(log_to_wandb, summary)
-        finish_wandb(log_to_wandb)
+        finish_wandb(log_to_wandb, summary)
         return summary
     finally:
         env.close()

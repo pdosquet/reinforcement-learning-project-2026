@@ -20,17 +20,20 @@ import importlib.util
 import itertools
 import json
 import os
+import statistics
 import sys
 import time
 import traceback
 from pathlib import Path
+
+from implementations.model_utils import finish_wandb, init_wandb_run
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Default benchmark configuration
 BENCHMARK_TASKS = ["hover", "waypoints"]
-BENCHMARK_MODES = [-1, 0, 4, 6, 7]
+BENCHMARK_MODES = [0, 4, 6, 7]
 BENCHMARK_SEEDS = [0, 1, 2]
 
 
@@ -145,6 +148,119 @@ def run_single(module, module_path, algorithm_name, task, mode, seed, timesteps,
     return out, model_info, None
 
 
+def aggregate_benchmark_results(results):
+    grouped = {}
+    for result in results:
+        key = (result["task"], result["mode"])
+        if key not in grouped:
+            grouped[key] = {
+                "total": 0,
+                "ok": 0,
+                "times": [],
+                "eval_rewards": [],
+            }
+
+        bucket = grouped[key]
+        bucket["total"] += 1
+        if result["status"] == "OK":
+            bucket["ok"] += 1
+            if isinstance(result.get("time_s"), (int, float)):
+                bucket["times"].append(float(result["time_s"]))
+            eval_reward = result.get("eval_reward_mean")
+            if isinstance(eval_reward, (int, float)):
+                bucket["eval_rewards"].append(float(eval_reward))
+
+    rows = []
+    for task, mode in sorted(grouped.keys()):
+        bucket = grouped[(task, mode)]
+        rows.append({
+            "task": task,
+            "mode": mode,
+            "mean_time_s": statistics.mean(bucket["times"]) if bucket["times"] else None,
+            "mean_eval_reward": statistics.mean(bucket["eval_rewards"]) if bucket["eval_rewards"] else None,
+            "success_rate": 100.0 * bucket["ok"] / bucket["total"] if bucket["total"] else 0.0,
+        })
+    return rows
+
+
+def log_benchmark_aggregates_to_wandb(enabled, algorithm_name, tasks, modes, seeds, timesteps, aggregate_rows):
+    if not enabled:
+        return
+
+    init_wandb_run(
+        enabled,
+        project="pyflyt-rl",
+        name=f"{algorithm_name}_benchmark_aggregate",
+        job_type="benchmark_aggregate",
+        config={
+            "algorithm": algorithm_name,
+            "tasks": list(tasks),
+            "modes": list(modes),
+            "seed_count": len(seeds),
+            "timesteps": timesteps,
+        },
+        tags=[algorithm_name, "benchmark", "aggregate"],
+        sync_tensorboard=False,
+    )
+
+    import wandb
+
+    aggregate_table = wandb.Table(
+        columns=["task", "mode", "mean_time_s", "mean_eval_reward", "success_rate"],
+        data=[
+            [row["task"], row["mode"], row["mean_time_s"], row["mean_eval_reward"], row["success_rate"]]
+            for row in aggregate_rows
+        ],
+    )
+    wandb.log({"benchmark_seed_aggregate": aggregate_table})
+
+    for task in sorted({row["task"] for row in aggregate_rows}):
+        task_rows = [row for row in aggregate_rows if row["task"] == task]
+
+        time_table = wandb.Table(
+            columns=["mode", "mean_time_s"],
+            data=[[row["mode"], row["mean_time_s"]] for row in task_rows if row["mean_time_s"] is not None],
+        )
+        if len(time_table.data) > 0:
+            wandb.log({
+                f"{task}/mean_time_s_by_mode": wandb.plot.line(
+                    time_table,
+                    "mode",
+                    "mean_time_s",
+                    title=f"{task}: mean training time across seeds",
+                )
+            })
+
+        reward_table = wandb.Table(
+            columns=["mode", "mean_eval_reward"],
+            data=[[row["mode"], row["mean_eval_reward"]] for row in task_rows if row["mean_eval_reward"] is not None],
+        )
+        if len(reward_table.data) > 0:
+            wandb.log({
+                f"{task}/mean_eval_reward_by_mode": wandb.plot.scatter(
+                    reward_table,
+                    "mode",
+                    "mean_eval_reward",
+                    title=f"{task}: mean eval reward across seeds",
+                )
+            })
+
+        success_table = wandb.Table(
+            columns=["mode", "success_rate"],
+            data=[[row["mode"], row["success_rate"]] for row in task_rows],
+        )
+        wandb.log({
+            f"{task}/success_rate_by_mode": wandb.plot.line(
+                success_table,
+                "mode",
+                "success_rate",
+                title=f"{task}: success rate across seeds",
+            )
+        })
+
+    finish_wandb(enabled)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train any model implementation module")
     parser.add_argument("--model", required=True, nargs="+", help="One or more paths to model implementation Python files")
@@ -245,6 +361,7 @@ def main():
                     "artifact": str(out),
                     "submission": info.get("submission_file"),
                     "time_s": info.get("training_time_s"),
+                    "eval_reward_mean": info.get("eval_reward_mean"),
                 })
 
         # Print summary table
@@ -256,6 +373,17 @@ def main():
             detail = r.get("submission") or r.get("artifact") or r.get("error", "")
             print(col.format(r["task"], r["mode"], r["seed"], r["status"], detail))
         print("")
+
+        aggregate_rows = aggregate_benchmark_results(results)
+        log_benchmark_aggregates_to_wandb(
+            enabled=not args.no_wandb,
+            algorithm_name=algorithm_name,
+            tasks=args.tasks,
+            modes=args.modes,
+            seeds=args.seeds,
+            timesteps=args.timesteps,
+            aggregate_rows=aggregate_rows,
+        )
 
 if __name__ == "__main__":
     main()

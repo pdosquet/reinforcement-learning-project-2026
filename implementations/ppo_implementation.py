@@ -283,7 +283,7 @@ def train_model(
     num_timesteps,
     log_to_wandb,
     output_dir,
-    eval_interval=10,
+    eval_interval=5,
     quick_eval_episodes=5,
 ):
     """Train the scratch PPO agent and save checkpoints in output_dir."""
@@ -306,9 +306,6 @@ def train_model(
         config={
             "algorithm": ALGORITHM_NAME,
             "task": task,
-            "flight_mode": flight_mode,
-            "seed": seed,
-            "num_timesteps": num_timesteps,
             **PPO_HYPERPARAMS,
         },
         tags=[ALGORITHM_NAME, task, f"mode_{flight_mode}"],
@@ -360,11 +357,10 @@ def train_model(
             )
             update_count += 1
 
-            if log_to_wandb and update_count % 5 == 0:
+            if log_to_wandb:
                 log_wandb(
                     log_to_wandb,
                     {
-                        "timesteps": total_timesteps,
                         "actor_loss": update_metrics["actor_loss"],
                         "critic_loss": update_metrics["critic_loss"],
                         "entropy": update_metrics["entropy"],
@@ -391,7 +387,6 @@ def train_model(
                     log_wandb(
                         log_to_wandb,
                         {
-                            "timesteps": total_timesteps,
                             "eval_mean_reward": stats["mean_reward"],
                             "best_eval_reward": best_eval_reward,
                         },
@@ -411,7 +406,11 @@ def train_model(
             "eval_reward_mean": best_eval_reward if best_checkpoint_path.exists() else float("nan"),
         }
 
-        finish_wandb(log_to_wandb, summary)
+        wandb_summary = {
+            "checkpoint_file": checkpoint_name,
+            "eval_reward_mean": summary["eval_reward_mean"],
+        }
+        finish_wandb(log_to_wandb, wandb_summary)
 
         env.close()
         return summary

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -70,6 +71,7 @@ def init_wandb_run(enabled: bool, **kwargs):
     """Initialize a W&B run only when logging is enabled."""
     if not enabled:
         return None
+    os.environ.setdefault("WANDB__DISABLE_STATS", "true")
     import wandb
 
     return wandb.init(**kwargs)
@@ -94,7 +96,8 @@ def finish_wandb(enabled: bool, summary=None):
     import wandb
 
     if summary is not None:
-        wandb.log(summary)
+        if wandb.run is not None:
+            wandb.run.summary.update(summary)
     wandb.finish()
 
 
