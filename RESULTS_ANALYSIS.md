@@ -179,6 +179,72 @@ All configs converge to the same reward plateau within 100k steps — unlike mod
 
 ---
 
+### SAC Waypoints First Sweep — mode 6, 100k (2026-04-19)
+
+**Goal:** First look at SAC on the waypoints task; compare UTD 2 vs 3 and two seeds, both at gamma=0.99 mode 6.
+
+**Config:** mode=6, timesteps=1e5, gamma=0.99, eval-episodes=20
+
+| Config | UTD | seed | Zoo run |
+|--------|-----|------|---------|
+| `sac_waypoints_g099_utd2_mode6` | 2 | 0 | `PyFlyt-QuadX-Waypoints-v4_1` |
+| `sac_waypoints_g099_utd2_mode6` | 2 | 1 | `PyFlyt-QuadX-Waypoints-v4_2` |
+| `sac_waypoints_g099_utd3_mode6` | 3 | 0 | `PyFlyt-QuadX-Waypoints-v4_3` |
+
+**Numerical results — training curve (monitor.csv):**
+
+| Run | overall mean ± std | reward range | best 10k window |
+|-----|--------------------|--------------|-----------------|
+| UTD2 seed0 | -317.6 ± 145.9 | [-626, -84] | -211.8 (50k) |
+| UTD2 seed1 | -364.8 ± 144.7 | [-665, -20] | -263.2 (30k) |
+| UTD3 seed0 | -408.7 ± 156.3 | [-720, -102] | -297.3 (70k) |
+
+Training ep_rew_mean per 10k window — all runs plateau in the **-300 to -450** range with no monotonic improvement:
+
+| 10k step | UTD2 s0 | UTD2 s1 | UTD3 s0 |
+|----------|---------|---------|---------|
+| 10k | -604.9 | -660.8 | -603.1 |
+| 20k | -313.8 | -316.6 | -360.9 |
+| 30k | -297.2 | -263.2 | -369.3 |
+| 40k | -274.7 | -374.3 | -320.3 |
+| 50k | -211.8 | -328.6 | -457.8 |
+| 60k | -321.1 | -433.6 | -486.0 |
+| 70k | -338.0 | -401.8 | -297.3 |
+| 80k | -463.9 | -294.2 | -495.5 |
+| 90k | -352.2 | -455.0 | -422.8 |
+| 100k | -318.5 | -279.5 | — |
+
+**Eval rewards (evaluations.npz, 20-episode deterministic):**
+
+| Run | final mean ± std | best eval mean |
+|-----|-----------------|----------------|
+| UTD2 seed0 | -97.7 ± 2.5 | -82.8 (20k) |
+| UTD2 seed1 | -91.8 ± 22.1 | -86.5 (40k) |
+| UTD3 seed0 | -98.2 ± 3.0 | -88.0 (10k) |
+
+Note the large gap between training rewards (~-300 to -450) and eval rewards (~-90): the deterministic best-model policy avoids crashing but the training curve noise reveals the policy is not actually navigating to waypoints.
+
+**Interpretation:**
+
+1. **Crash avoidance only.** The initial reward (~-600) corresponds to the drone crashing within the first ~20-30 steps, accumulating large step-wise penalties. By 20k steps the agent learns to stay airborne, which cuts the penalty in half. After that: **total plateau**. The drone flies away from the starting position without crashing but never reaches a waypoint.
+
+2. **Sparse reward problem.** The waypoints task provides no dense guidance — the reward signal only triggers when the drone comes within `goal_reach_distance=4.0m` of a target. With random or early policies in a `flight_dome_size=150m` arena, the probability of accidentally reaching a waypoint in 100k steps is near zero. The agent cannot bootstrap from the sparse signal.
+
+3. **No progress signal from UTD.** Higher update-to-data ratio (UTD=3) does not help: UTD3 seed0 actually trends slightly worse (~-408 mean) than UTD2 (~-318 and -364). More gradient steps per transition amplifies noise when there are no informative reward signals to exploit.
+
+4. **Reward variance.** The large std (145-156) reflects the bimodal nature of episodes: either the drone crashes early (reward ~-600) or survives and drifts (-100 to -200). There is no middle ground corresponding to reaching waypoints.
+
+**Conclusion:**
+
+100k steps is **fundamentally insufficient** for the waypoints task. The agent learns a single non-trivial behavior (crash avoidance) but hits a hard ceiling because the sparse waypoint reward is never triggered. There is no learning signal to guide navigation. UTD ratio is irrelevant in this regime. **The minimum viable budget is estimated at 500k–1M steps**, with a denser reward shaping or curriculum (e.g. smaller dome, larger goal_reach_distance as a warm-up, or potential-based shaping) as an alternative path.
+
+**Next steps:**
+- Rerun `sac_waypoints_g099_utd2_mode6` at 1M steps (single seed first) to check if the sparse reward is eventually discovered
+- Consider reward shaping: add a dense component proportional to negative distance to the current waypoint
+- Consider curriculum: start with `flight_dome_size=30`, `goal_reach_distance=8`, gradually increase difficulty
+
+---
+
 ## SAC Reference
 
 | Config | task | gamma | UTD | mode | seeds | Zoo runs | mean reward |

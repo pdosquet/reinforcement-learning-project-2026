@@ -5,6 +5,49 @@ import numpy as np
 from gymnasium import spaces
 
 
+class WaypointDistanceShaping(gymnasium.RewardWrapper):
+    """Potential-based reward shaping for PyFlyt Waypoints envs.
+
+    Adds φ(s') − φ(s) to each step reward, where:
+        φ(s) = −shaping_coef × Σ ‖target_delta_i‖  (sum over remaining waypoints)
+
+    Using the sum of all remaining distances eliminates the reward spike at
+    waypoint transitions: the completed delta is ≈ 0 just before it drops from
+    the list, so the potential changes smoothly.
+
+    Must be applied BEFORE FlattenWaypointEnv (inner wrapper) so it sees the
+    raw Dict observation with 'target_deltas'.
+    """
+
+    def __init__(self, env, shaping_coef: float = 0.01):
+        super().__init__(env)
+        self.shaping_coef = shaping_coef
+        self._prev_potential: float = 0.0
+
+    def _potential(self, obs) -> float:
+        deltas = obs["target_deltas"]  # (N, 3)
+        return -self.shaping_coef * float(np.linalg.norm(deltas, axis=1).sum())
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._prev_potential = self._potential(obs)
+        return obs, info
+
+    def reward(self, reward):
+        # Called by gymnasium after step(); obs already updated via self.env.step()
+        # We need the current obs — access via the unwrapped env's last obs.
+        # gymnasium.RewardWrapper does not pass obs here, so we cache it in step().
+        shaping = self._curr_potential - self._prev_potential
+        self._prev_potential = self._curr_potential
+        return reward + shaping
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._curr_potential = self._potential(obs)
+        shaped_reward = self.reward(reward)
+        return obs, shaped_reward, terminated, truncated, info
+
+
 class FlattenWaypointEnv(gymnasium.ObservationWrapper):
     """Flattens the Dict observation of PyFlyt Waypoints envs into a single Box.
 
