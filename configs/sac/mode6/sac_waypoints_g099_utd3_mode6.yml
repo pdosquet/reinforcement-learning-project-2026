@@ -1,0 +1,26 @@
+_meta:
+  algo: sac
+  task: waypoints  # PyFlyt/QuadX-Waypoints-v4
+
+PyFlyt/QuadX-Waypoints-v4:
+  n_timesteps: !!float 1e5
+  policy: MlpPolicy
+  learning_rate: 3.0e-4
+  buffer_size: 50000
+  learning_starts: 5000
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 3  # UTD = 3
+  ent_coef: auto
+  target_update_interval: 1
+  policy_kwargs: "dict(net_arch=[256, 256])"
+  env_kwargs:
+    goal_reach_distance: 4.0
+    flight_dome_size: 150.0
+    max_duration_seconds: 120.0
+    num_targets: 4
+  env_wrapper:
+    - scripts.wrappers.FlattenWaypointEnv:
+        max_waypoints: 4

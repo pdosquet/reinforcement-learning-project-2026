@@ -21,3 +21,5 @@ wandb/
 
 # Claude
 .claude/
+runs/
+tmp/

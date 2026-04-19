@@ -101,6 +101,116 @@ def finish_wandb(enabled: bool, summary=None):
     wandb.finish()
 
 
+def make_sb3_wandb_callback(enabled: bool):
+    """Return a callback that logs SB3 training metrics to W&B every 500 steps.
+
+    WandbCallback(gradient_save_freq=0) never logs by default — we need a
+    custom callback that manually dumps SB3's internal logger to W&B.
+    """
+    if not enabled:
+        return None
+
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class _MetricLoggerCallback(BaseCallback):
+        """Log SB3 training metrics + episode rewards to W&B every log_freq steps."""
+
+        def __init__(self, log_freq: int = 500):
+            super().__init__()
+            self.log_freq = log_freq
+
+        def _on_step(self) -> bool:
+            if self.n_calls % self.log_freq != 0:
+                return True
+            import wandb
+            if wandb.run is None:
+                return True
+
+            metrics = {
+                k: v
+                for k, v in self.model.logger.name_to_value.items()
+                if v is not None
+            }
+
+            # SB3 only flushes ep_rew_mean every 4 episodes — read directly
+            if len(self.model.ep_info_buffer) > 0:
+                metrics["rollout/ep_rew_mean"] = np.mean(
+                    [ep["r"] for ep in self.model.ep_info_buffer]
+                )
+                metrics["rollout/ep_len_mean"] = np.mean(
+                    [ep["l"] for ep in self.model.ep_info_buffer]
+                )
+
+            if metrics:
+                wandb.log(metrics, step=self.num_timesteps)
+            return True
+
+    return _MetricLoggerCallback(log_freq=500)
+
+
+def log_policy_video(enabled: bool, model, task: str, flight_mode: int, max_steps: int = 500):
+    """Record one deterministic rollout and upload it as a W&B video.
+
+    Creates a temporary rgb_array env, runs the policy greedily, and logs the
+    resulting clip. Works headless: PyBullet uses its own software renderer for
+    rgb_array mode and only needs a dummy DISPLAY value to initialise.
+    Skips silently if anything goes wrong — never crashes training.
+    """
+    if not enabled:
+        return
+
+    # PyBullet needs DISPLAY set to initialise even in headless/rgb_array mode.
+    os.environ.setdefault("DISPLAY", ":99")
+
+    render_env = None
+    try:
+        if task == "hover":
+            render_env = gymnasium.make(
+                "PyFlyt/QuadX-Hover-v4",
+                flight_mode=flight_mode,
+                render_mode="rgb_array",
+            )
+        elif task == "waypoints":
+            env_base = gymnasium.make(
+                "PyFlyt/QuadX-Waypoints-v4",
+                flight_mode=flight_mode,
+                render_mode="rgb_array",
+                **get_env_kwargs("waypoints"),
+            )
+            render_env = FlattenWaypointEnv(env_base, max_waypoints=4)
+        else:
+            return
+
+        frames = []
+        obs, _ = render_env.reset()
+        for _ in range(max_steps):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, _, terminated, truncated, _ = render_env.step(action)
+            frame = render_env.render()
+            if frame is not None:
+                frames.append(frame)
+            if terminated or truncated:
+                break
+
+        if not frames:
+            return
+
+        import wandb
+
+        # PyBullet returns RGBA (H, W, 4) — drop alpha, wandb.Video needs RGB.
+        # wandb.Video expects (T, C, H, W) uint8.
+        video = np.stack(frames)[..., :3].astype(np.uint8)  # (T, H, W, 3)
+        video = np.transpose(video, (0, 3, 1, 2))            # (T, C, H, W)
+        wandb.log({f"policy_video/{task}_mode{flight_mode}": wandb.Video(video, fps=24, format="mp4")})
+
+    except Exception as exc:  # noqa: BLE001
+        # Video logging is best-effort — never crash training over it
+        print(f"  [video] skipped ({exc})")
+    finally:
+        if render_env is not None:
+            render_env.close()
+
+
 def load_artifact_metadata(artifact_dir) -> dict:
     """Load model_info.json from an artifact directory when available."""
     info_path = Path(artifact_dir) / "model_info.json"
