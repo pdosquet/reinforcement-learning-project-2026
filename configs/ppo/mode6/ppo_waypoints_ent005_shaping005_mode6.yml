@@ -11,7 +11,7 @@ PyFlyt/QuadX-Waypoints-v4:
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  ent_coef: 0.01
+  ent_coef: 0.05
   vf_coef: 0.5
   max_grad_norm: 0.5
   policy_kwargs: "dict(net_arch=dict(pi=[64, 64], vf=[64, 64]))"
@@ -22,6 +22,6 @@ PyFlyt/QuadX-Waypoints-v4:
     num_targets: 4
   env_wrapper:
     - scripts.wrappers.WaypointSumDistanceShaping:
-        shaping_coef: 0.01
+        shaping_coef: 0.05
     - scripts.wrappers.FlattenWaypointEnv:
         max_waypoints: 4

@@ -5,15 +5,11 @@ import numpy as np
 from gymnasium import spaces
 
 
-class WaypointDistanceShaping(gymnasium.RewardWrapper):
-    """Potential-based reward shaping for PyFlyt Waypoints envs.
+class WaypointSumDistanceShaping(gymnasium.RewardWrapper):
+    """Potential-based reward shaping using the sum of all remaining waypoint distances.
 
     Adds φ(s') − φ(s) to each step reward, where:
         φ(s) = −shaping_coef × Σ ‖target_delta_i‖  (sum over remaining waypoints)
-
-    Using the sum of all remaining distances eliminates the reward spike at
-    waypoint transitions: the completed delta is ≈ 0 just before it drops from
-    the list, so the potential changes smoothly.
 
     Must be applied BEFORE FlattenWaypointEnv (inner wrapper) so it sees the
     raw Dict observation with 'target_deltas'.
@@ -34,9 +30,46 @@ class WaypointDistanceShaping(gymnasium.RewardWrapper):
         return obs, info
 
     def reward(self, reward):
-        # Called by gymnasium after step(); obs already updated via self.env.step()
-        # We need the current obs — access via the unwrapped env's last obs.
-        # gymnasium.RewardWrapper does not pass obs here, so we cache it in step().
+        shaping = self._curr_potential - self._prev_potential
+        self._prev_potential = self._curr_potential
+        return reward + shaping
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._curr_potential = self._potential(obs)
+        shaped_reward = self.reward(reward)
+        return obs, shaped_reward, terminated, truncated, info
+
+
+class WaypointDistanceShaping(gymnasium.RewardWrapper):
+    """Potential-based reward shaping on the next waypoint only.
+
+    Adds φ(s') − φ(s) to each step reward, where:
+        φ(s) = −shaping_coef × ‖target_deltas[0]‖  (next waypoint only)
+
+    Focusing on the next waypoint ensures the agent is incentivised to reach
+    waypoints in order, and keeps the potential scale consistent across
+    curriculum stages regardless of num_targets.
+
+    Must be applied BEFORE FlattenWaypointEnv (inner wrapper) so it sees the
+    raw Dict observation with 'target_deltas'.
+    """
+
+    def __init__(self, env, shaping_coef: float = 0.01):
+        super().__init__(env)
+        self.shaping_coef = shaping_coef
+        self._prev_potential: float = 0.0
+
+    def _potential(self, obs) -> float:
+        delta = obs["target_deltas"][0]  # next waypoint only
+        return -self.shaping_coef * float(np.linalg.norm(delta))
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._prev_potential = self._potential(obs)
+        return obs, info
+
+    def reward(self, reward):
         shaping = self._curr_potential - self._prev_potential
         self._prev_potential = self._curr_potential
         return reward + shaping
@@ -81,3 +114,25 @@ class FlattenWaypointEnv(gymnasium.ObservationWrapper):
         padded[:n] = targets[:n]
 
         return np.concatenate([attitude, padded.flatten()])
+
+
+class ActionRepeat(gymnasium.Wrapper):
+    """Repeat each action for n consecutive env steps, accumulating reward.
+
+    The agent acts every n timesteps instead of every timestep. This gives the
+    PID controller time to execute the velocity command before the agent
+    observes the outcome, reducing the effective lag seen during learning.
+    """
+
+    def __init__(self, env, n: int = 4):
+        super().__init__(env)
+        self.n = n
+
+    def step(self, action):
+        total_reward = 0.0
+        for _ in range(self.n):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+        return obs, total_reward, terminated, truncated, info

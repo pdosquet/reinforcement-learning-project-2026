@@ -245,6 +245,140 @@ Note the large gap between training rewards (~-300 to -450) and eval rewards (~-
 
 ---
 
+### PPO Waypoints Sweep — mode 6, shaping ablation (2026-04-19)
+
+**Goal:** Establish PPO baselines on waypoints with reward shaping; ablate `ent_coef` and `shaping_coef`.
+
+**Config:** mode=6, seeds=[0, 1], gamma=0.99, n_steps=2048, `WaypointDistanceShaping` active on all runs
+
+| Config | ent_coef | shaping_coef | timesteps | Zoo runs |
+|--------|----------|--------------|-----------|----------|
+| `ppo_waypoints_mode6` | 0.01 | 0.01 | 100k | _1, _2 |
+| `ppo_waypoints_mode6` | 0.01 | 0.01 | 500k | _3, _4 |
+| `ppo_waypoints_ent005_shaping005_mode6` | 0.05 | 0.05 | 500k | _5, _6 |
+| `ppo_waypoints_ent001_shaping02_mode6` | 0.01 | 0.20 | 500k | _7, _8 |
+
+**Eval results (deterministic, 20 episodes):**
+
+| Zoo run | config | steps | final eval | best eval | final ep_len |
+|---------|--------|-------|------------|-----------|--------------|
+| _1 | baseline seed0 | 100k | -92.1 | -81.5 | 42 |
+| _2 | baseline seed1 | 100k | -97.0 | -96.5 | 18 |
+| _3 | baseline seed0 | 500k | -91.3 | -80.5 | 20 |
+| _4 | baseline seed1 | 500k | -94.5 | -76.8 | 38 |
+| _5 | ent005 seed0 | 500k | -98.6 | -77.8 | 22 |
+| _6 | ent005 seed1 | 500k | -98.4 | -88.7 | 25 |
+| _7 | ent001_shaping02 seed0 | 500k | -90.9 | -82.5 | 46 |
+| _8 | ent001_shaping02 seed1 | 300k | -93.4 | -79.8 | 45 |
+
+**Key observations:**
+
+1. **Shaping alone (0.01) is insufficient.** Runs 1–4 (baseline, shaping=0.01) show no improvement from 100k to 500k. Best eval stays around -77 to -81, ep_len fluctuates 18–42. The dense signal is too weak relative to the crash penalty — the drone learns crash avoidance but not navigation.
+
+2. **High ent_coef (0.05) causes entropy trap.** Runs 5–6 show `rollout/ep_len_mean` at 3600 (full episodes) during training — the stochastic policy stays airborne. But `eval/mean_ep_len` drops to 22–25 — the deterministic policy crashes immediately. The policy has learned to output high-variance random actions to stay airborne by chance; the underlying action mean is useless. Visually confirmed: the drone flies away immediately in deterministic mode.
+
+3. **Stronger shaping (0.2) with ent=0.01 is the best so far.** Runs 7–8 have the highest final ep_len (45–46) in eval, and `eval/mean_ep_len` was observed to progress during training rather than stay flat. The stronger dense signal (0.2) guides the deterministic policy toward waypoints without masking it with entropy noise.
+
+4. **500k is still insufficient for sparse waypoint reward breakthrough.** No run reaches a positive eval reward — the drone navigates better but has not consistently entered the 4m goal radius in deterministic eval. The `rollout/ep_rew_mean` was observed rising in runs 7–8 (shaped reward increasing), but the sparse component hasn't triggered.
+
+**Conclusion:**
+The best PPO configuration found so far is `ent_coef=0.01, shaping_coef=0.2`. The drone shows meaningful improvement in deterministic episode length. However 500k steps in a 150m dome with a 4m goal radius remains too hard — the agent needs either more steps, a larger goal radius, or a curriculum. **Curriculum approach (smaller dome, larger goal, 1 target) launched next.**
+
+---
+
+### SAC Waypoints with Reward Shaping — mode 6, 100k (2026-04-19)
+
+**Goal:** Rerun `sac_waypoints_g099_utd2_mode6` with `WaypointDistanceShaping` (shaping_coef=0.01) to compare against the unshapped first sweep.
+
+**Config:** mode=6, gamma=0.99, UTD=2, seeds=[0, 1], timesteps=100k
+
+| Zoo run | seed | final eval | best eval | final ep_len |
+|---------|------|------------|-----------|--------------|
+| _4 | 0 | -90.3 | -89.4 | 48 |
+| _5 | 1 | -98.2 | -90.8 | 15 |
+
+**Comparison vs unshapped (runs _1, _2):**
+
+| | unshapped seed0 | unshapped seed1 | shaped seed0 | shaped seed1 |
+|---|---|---|---|---|
+| best eval | -82.8 | -86.5 | -89.4 | -90.8 |
+| final ep_len | 19 | 16 | 48 | 15 |
+
+Shaped seed0 shows higher ep_len (48 vs 19) suggesting the deterministic policy survives longer, but best eval reward is actually slightly worse. At 100k steps, shaping_coef=0.01 is too weak to make a meaningful difference for SAC either — the same conclusion as PPO.
+
+**Next step:** Run SAC with shaping_coef=0.2 at higher timesteps, or focus on curriculum first.
+
+---
+
+### PPO Waypoints Curriculum — mode 6, easy settings (2026-04-19)
+
+**Goal:** Break the sparse reward barrier by simplifying the task: 1 target, 30m dome, 10m goal radius. Establish whether the policy can learn single-waypoint navigation before scaling up.
+
+**Config:** mode=6, seeds=[0, 1], timesteps=500k–1M, ent_coef=0.01, shaping_coef=0.2
+- `num_targets=1`, `flight_dome_size=30`, `goal_reach_distance=10`, `max_waypoints=1` (obs size 24)
+
+| Config | seeds | timesteps | best eval | final eval |
+|--------|-------|-----------|-----------|------------|
+| `ppo_waypoints_curriculum_mode6` | 0, 1 | 500k | -70.3 (s0), -84.0 (s1) | -94.6 (s0), -97.8 (s1) |
+| `ppo_waypoints_curriculum_s2_mode6` | 0 | 410k | -92.6 | -96.4 |
+| `ppo_waypoints_curriculum_v2_mode6` | 0, 1 | 1M | -83.7 (s0), -66.8 (s1) | -97.2 (s0), -88.3 (s1) |
+
+SAC curriculum also ran (`sac_waypoints_curriculum_mode6`, seed 0, 540k steps): final eval -104.3, best -96.1 — worse than baseline, drifting negatively over time.
+
+**Conclusion:**
+The curriculum approach did not break through on mode 6. PPO curriculum v2 seed1 reaches a best of -66.8 around 730k steps but collapses back afterward. No run achieves a positive eval reward. The easy task settings (30m dome, 10m goal) are not sufficient to bridge to mode 6 navigation. SAC curriculum actively degrades.
+
+---
+
+### SAC Waypoints mode 0 — undocumented runs, retroactive analysis (2026-04-19)
+
+**Note:** These runs were executed as part of the same experiment batch as the mode 6 waypoints sweeps but were never written up. The configs are in `configs/sac/mode0/`. Results are in `results/artifacts/` (not in the zoo).
+
+**Config:** `PyFlyt/QuadX-Waypoints-v4`, same env settings as mode 6 (`flight_dome_size=150`, `goal_reach_distance=4`, `num_targets=4`), same `WaypointDistanceShaping(shaping_coef=0.01)` + `FlattenWaypointEnv`. Only difference from mode 6 configs: `flight_mode=0`.
+
+| Config | seed | best eval | final eval | artifact |
+|--------|------|-----------|------------|----------|
+| `sac_waypoints_g099_utd2_mode0` | 0 | **316.5** | 316.5 | `sac_waypoints_g099_utd2_waypoints_mode0_seed0` |
+| `sac_waypoints_g099_utd2_mode0` | 1 | 67.4 | 27.3 | `sac_waypoints_g099_utd2_waypoints_mode0_seed1` |
+| `sac_waypoints_g099_utd3_mode0` | 0 | **477.1** | -37.1 | `sac_waypoints_g099_utd3_waypoints_mode0_seed0` |
+| `sac_waypoints_g099_utd3_mode0` | 1 | 34.2 | -109.9 | `sac_waypoints_g099_utd3_waypoints_mode0_seed1` |
+| `sac_waypoints_g0995_utd2_mode0` | 0 | 162.4 | -11.8 | `sac_waypoints_g0995_utd2_waypoints_mode0_seed0` |
+| `sac_waypoints_g0995_utd2_mode0` | 1 | **396.9** | 166.6 | `sac_waypoints_g0995_utd2_waypoints_mode0_seed1` |
+| `sac_waypoints_g0995_utd3_mode0` | 0 | **389.5** | 389.5 | `sac_waypoints_g0995_utd3_waypoints_mode0_seed0` |
+| `sac_waypoints_g0995_utd3_mode0` | 1 | 67.9 | -63.8 | `sac_waypoints_g0995_utd3_waypoints_mode0_seed1` |
+
+For completeness, mode 6 artifact results (same configs, same 100k budget):
+
+| Config | seed | best eval | final eval |
+|--------|------|-----------|------------|
+| `sac_waypoints_g099_utd2_mode6` | 0 | -222.5 | -222.5 |
+| `sac_waypoints_g099_utd2_mode6` | 1 | -155.2 | -194.4 |
+| `sac_waypoints_g099_utd3_mode6` | 0 | -250.5 | -361.5 |
+| `sac_waypoints_g099_utd3_mode6` | 1 | -156.3 | -339.1 |
+| `sac_waypoints_g0995_utd2_mode6` | 0 | -224.5 | -224.5 |
+| `sac_waypoints_g0995_utd2_mode6` | 1 | -177.4 | -249.0 |
+| `sac_waypoints_g0995_utd3_mode6` | 0 | -190.9 | -206.8 |
+| `sac_waypoints_g0995_utd3_mode6` | 1 | -194.8 | -329.3 |
+
+**Statistical caveat:** The artifact evals use only **5 episodes per checkpoint**, vs 20 in the zoo runs. With such small samples, a single high-reward episode can dominate the mean. The reported means must be read alongside the per-episode min/max.
+
+**Key observations:**
+
+1. **Mode 0 does occasionally reach waypoints; mode 6 does not.** The shaping coefficient is 0.01 and distances are O(10–100m), so the shaping term contributes at most a few units per step. Episode rewards of +500 to +1800 can only come from the sparse goal bonus — the drone is physically reaching waypoints. No mode 6 episode across any run exceeds +5.
+
+2. **Mode 0 positive results are real but not stable.** The high means are largely driven by single outlier episodes. For example at 100k steps: `g099_utd2_seed0` shows mean=316 but min=-106 and max=1313 (5 episodes); `g0995_utd3_seed0` shows mean=390 but min=-118 and max=1825. The most convincing evidence of genuine learning is `g0995_utd3_seed0` at steps 80k–90k where **all 5 eval episodes are positive** (80k: min=2.9, max=889; 90k: min=14.3, max=288). After that the policy regresses.
+
+3. **No run has a consistently positive policy.** The mode 0 agent occasionally discovers waypoint-reaching behavior but does not retain it reliably. This is exploratory success, not convergence.
+
+4. **Mode 6 is stuck at a different reward scale entirely.** Mode 6 artifact evals sit in the -200 to -400 range (raw training checkpoints), consistent with the zoo runs (-90 to -103 on the best saved model). No waypoint is ever reached.
+
+5. **The mode 0 vs mode 6 gap is real but the cause is unclear.** The configs are identical. Mode 0 (angular velocity + thrust) gives the agent more direct control over the drone's motion; mode 6 (world-frame velocity commands) routes through a multi-layer PID stack that introduces lag and dampening. Whether this explains the gap or whether it is a sample-efficiency artifact of SAC's replay buffer with these dynamics is unknown.
+
+**Conclusion:**
+Mode 0 SAC shows early signs of waypoint navigation within 100k steps but the policy is unstable and highly variable. Mode 6 shows no waypoint navigation at all. Both findings are based on low-sample evals (5 episodes) — **these results should be treated as exploratory, not conclusive**. The right next step for mode 0 is a longer run (500k+) with more eval episodes to establish whether the policy can be stabilized. Mode 6 remains a separate unsolved problem.
+
+---
+
 ## SAC Reference
 
 | Config | task | gamma | UTD | mode | seeds | Zoo runs | mean reward |
