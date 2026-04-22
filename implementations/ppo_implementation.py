@@ -32,11 +32,12 @@ from implementations.model_utils import (
 
 
 class ActorNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size=64, action_std_init=0.6):
+    def __init__(self, state_dim, action_dim, hidden_size=64, action_std_init=0.3):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc_mean = nn.Linear(hidden_size, action_dim)
+        # Reduced initial action std from 0.6 to 0.3 for better stability
         self.log_std = nn.Parameter(torch.ones(1, action_dim) * np.log(action_std_init))
         self.tanh = nn.Tanh()
 
@@ -90,17 +91,22 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
+        self.learning_rate = learning_rate
 
         self.actor = ActorNetwork(state_dim, action_dim, hidden_size).to(device)
         self.critic = CriticNetwork(state_dim, hidden_size).to(device)
-        self.actor_old = ActorNetwork(state_dim, action_dim, hidden_size).to(device)
-        self._copy_actor_to_old()
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate / 2)
-
-    def _copy_actor_to_old(self):
-        self.actor_old.load_state_dict(self.actor.state_dict())
+        # Use lower learning rate for critic for better stability
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate * 0.5)
+        
+        # Learning rate schedulers for gradual decay
+        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.actor_optimizer, T_max=1000, eta_min=learning_rate * 0.1
+        )
+        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.critic_optimizer, T_max=1000, eta_min=learning_rate * 0.05
+        )
 
     def predict(self, obs, deterministic=False):
         if isinstance(obs, np.ndarray):
@@ -132,54 +138,83 @@ class PPOAgent:
             advantages[index] = gae
 
         returns = advantages + values
+        # Clip extreme advantages to prevent training instability
+        advantages = np.clip(advantages, -5.0, 5.0)
         return advantages, returns
 
     def update(self, states, actions, log_probs_old, advantages, returns, epochs=10):
+        # Tighter normalization and clipping for stability
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = np.clip(advantages, -3.0, 3.0)  # Tighter clipping: ±3 instead of ±10
+        
         states_t = torch.FloatTensor(states).to(self.device)
         actions_t = torch.FloatTensor(actions).to(self.device)
         log_probs_old_t = torch.FloatTensor(log_probs_old).to(self.device)
         advantages_t = torch.FloatTensor(advantages).to(self.device)
         returns_t = torch.FloatTensor(returns).to(self.device)
+        
+        # Normalize returns for value function fitting
+        returns_normalized = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
         actor_losses = []
         critic_losses = []
         clip_fractions = []
+        policy_kl_divs = []
 
-        for _ in range(epochs):
+        for epoch_idx in range(epochs):
             dist = self.actor.get_distribution(states_t)
             log_probs_new = dist.log_prob(actions_t).sum(dim=-1)
             entropy = dist.entropy().mean()
             values_new = self.critic(states_t).squeeze(-1)
 
             ratio = torch.exp(log_probs_new - log_probs_old_t)
+            
+            # Clipped surrogate loss with smaller clipping range for stability
             surr1 = ratio * advantages_t
             surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages_t
-            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
-            critic_loss = ((values_new - returns_t) ** 2).mean()
+            
+            # Entropy decays over epochs within update
+            entropy_coef_scaled = self.entropy_coef * (1.0 - epoch_idx / max(1, epochs))
+            actor_loss = -torch.min(surr1, surr2).mean() - entropy_coef_scaled * entropy
+            
+            # Improved value loss with Huber-like clipping per sample
+            value_error = values_new - returns_normalized
+            # Clip large value errors to prevent value divergence
+            value_error_clipped = torch.clamp(value_error, -1.0, 1.0)
+            critic_loss = (value_error_clipped ** 2).mean() * self.value_loss_coef
 
             with torch.no_grad():
                 clipped = (ratio > 1 + self.clip_ratio) | (ratio < 1 - self.clip_ratio)
                 clip_fractions.append(clipped.float().mean().item())
+                # Track KL divergence for debugging policy drift
+                kl_div = (log_probs_old_t - log_probs_new).mean().item()
+                policy_kl_divs.append(kl_div)
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            # More conservative gradient clipping
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm * 0.5)
             self.actor_optimizer.step()
 
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            # More conservative gradient clipping for value network
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm * 0.5)
             self.critic_optimizer.step()
 
             actor_losses.append(actor_loss.item())
             critic_losses.append(critic_loss.item())
+
+        # Step learning rate schedulers
+        self.actor_scheduler.step()
+        self.critic_scheduler.step()
 
         return {
             "actor_loss": float(np.mean(actor_losses)),
             "critic_loss": float(np.mean(critic_losses)),
             "entropy": float(entropy.item()),
             "clip_fraction": float(np.mean(clip_fractions)),
+            "policy_kl_div": float(np.mean(policy_kl_divs)),
         }
 
     def save(self, filepath, hyperparams=None):
@@ -202,7 +237,6 @@ class PPOAgent:
         self.critic.load_state_dict(checkpoint["critic"])
         self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
-        self._copy_actor_to_old()
 
 
 class PPOTrainer:
@@ -263,7 +297,7 @@ def load_checkpoint_metadata(checkpoint_path, device):
 
 ALGORITHM_NAME = "ppo"
 PPO_HYPERPARAMS = {
-    "learning_rate": 3e-4,
+    "learning_rate": 2e-4,  # Reduced from 3e-4 for more conservative updates
     "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_ratio": 0.2,
@@ -285,8 +319,17 @@ def train_model(
     output_dir,
     eval_interval=5,
     quick_eval_episodes=5,
+    hyperparams_override=None,
 ):
-    """Train the scratch PPO agent and save checkpoints in output_dir."""
+    """Train the scratch PPO agent and save checkpoints in output_dir.
+
+    Args:
+        hyperparams_override: optional dict that overrides individual keys in
+            PPO_HYPERPARAMS (e.g. when called from train_zoo.py with a YAML config).
+    """
+    hp = {**PPO_HYPERPARAMS}
+    if hyperparams_override:
+        hp.update({k: v for k, v in hyperparams_override.items() if k in PPO_HYPERPARAMS})
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -306,7 +349,7 @@ def train_model(
         config={
             "algorithm": ALGORITHM_NAME,
             "task": task,
-            **PPO_HYPERPARAMS,
+            **hp,
         },
         tags=[ALGORITHM_NAME, task, f"mode_{flight_mode}"],
         sync_tensorboard=False,
@@ -317,28 +360,28 @@ def train_model(
             state_dim=state_dim,
             action_dim=action_dim,
             device=device,
-            learning_rate=PPO_HYPERPARAMS["learning_rate"],
-            gamma=PPO_HYPERPARAMS["gamma"],
-            gae_lambda=PPO_HYPERPARAMS["gae_lambda"],
-            clip_ratio=PPO_HYPERPARAMS["clip_ratio"],
-            entropy_coef=PPO_HYPERPARAMS["entropy_coef"],
-            value_loss_coef=PPO_HYPERPARAMS["value_loss_coef"],
-            max_grad_norm=PPO_HYPERPARAMS["max_grad_norm"],
-            hidden_size=PPO_HYPERPARAMS["hidden_size"],
+            learning_rate=hp["learning_rate"],
+            gamma=hp["gamma"],
+            gae_lambda=hp["gae_lambda"],
+            clip_ratio=hp["clip_ratio"],
+            entropy_coef=hp["entropy_coef"],
+            value_loss_coef=hp["value_loss_coef"],
+            max_grad_norm=hp["max_grad_norm"],
+            hidden_size=hp["hidden_size"],
         )
         trainer = PPOTrainer(
             env=env,
             agent=agent,
-            trajectory_length=PPO_HYPERPARAMS["trajectory_length"],
-            epochs_per_update=PPO_HYPERPARAMS["epochs_per_update"],
+            trajectory_length=hp["trajectory_length"],
+            epochs_per_update=hp["epochs_per_update"],
         )
 
         total_timesteps = 0
         update_count = 0
 
         while total_timesteps < num_timesteps:
-            trajectory = trainer.collect_trajectory(PPO_HYPERPARAMS["trajectory_length"])
-            total_timesteps += PPO_HYPERPARAMS["trajectory_length"]
+            trajectory = trainer.collect_trajectory(hp["trajectory_length"])
+            total_timesteps += hp["trajectory_length"]
 
             advantages, returns = agent.compute_advantages(
                 trajectory["states"],
@@ -353,7 +396,7 @@ def train_model(
                 trajectory["log_probs"],
                 advantages,
                 returns,
-                epochs=PPO_HYPERPARAMS["epochs_per_update"],
+                epochs=hp["epochs_per_update"],
             )
             update_count += 1
 
@@ -365,6 +408,7 @@ def train_model(
                         "critic_loss": update_metrics["critic_loss"],
                         "entropy": update_metrics["entropy"],
                         "clip_fraction": update_metrics["clip_fraction"],
+                        "policy_kl_div": update_metrics["policy_kl_div"],
                     },
                     step=total_timesteps,
                 )
@@ -378,7 +422,7 @@ def train_model(
                 )
                 if stats["mean_reward"] > best_eval_reward:
                     best_eval_reward = stats["mean_reward"]
-                    agent.save(str(best_checkpoint_path), hyperparams=PPO_HYPERPARAMS)
+                    agent.save(str(best_checkpoint_path), hyperparams=hp)
                 print(
                     f"  [update {update_count:4d} | steps {total_timesteps:>10,}] "
                     f"eval={stats['mean_reward']:.2f}  best={best_eval_reward:.2f}"
@@ -393,7 +437,7 @@ def train_model(
                         step=total_timesteps,
                     )
 
-        agent.save(str(checkpoint_path), hyperparams=PPO_HYPERPARAMS)
+        agent.save(str(checkpoint_path), hyperparams=hp)
         checkpoint_name = "best_checkpoint.pt" if best_checkpoint_path.exists() else checkpoint_path.name
 
         summary = {

@@ -3,19 +3,26 @@
 Reads a YAML config from configs/, injects the flight mode into env_kwargs,
 and delegates to rl_zoo3.train via subprocess.
 
-Single run:
-    python train_zoo.py --config configs/sac_hover_g098_utd3.yml --mode 0 --seed 0
-    python train_zoo.py --config configs/sac_hover_g098_utd3.yml --mode 0 --seed 0 --no-wandb
-    python train_zoo.py --config configs/sac_hover_g098_utd3.yml --mode 0 --seed 0 --timesteps 200000
+If _meta.impl is set in the YAML, the config's hyperparameters are forwarded
+to that Python implementation's train_model() directly instead of rl_zoo3.
+
+Single run (Zoo/SB3 algos):
+    python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0
+    python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0 --no-wandb
+    python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0 --timesteps 200000
+
+Single run (scratch PPO via _meta.impl):
+    python train_zoo.py --config configs/ppo_scratch/ppo_scratch_hover_mode0.yml --mode 0 --seed 0
 
 Sweep over multiple modes / seeds:
-    python train_zoo.py --config configs/sac_hover_g098_utd3.yml --modes 0 6 --seeds 0 1 2
+    python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --modes 0 6 --seeds 0 1 2
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import itertools
 import os
 import subprocess
@@ -27,18 +34,36 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# Keys that appear in SB3/Zoo YAML configs and map to scratch PPO hyperparams.
+_SB3_TO_SCRATCH_KEY_MAP = {
+    "learning_rate": "learning_rate",
+    "gamma": "gamma",
+    "gae_lambda": "gae_lambda",
+    "clip_range": "clip_ratio",
+    "ent_coef": "entropy_coef",
+    "vf_coef": "value_loss_coef",
+    "max_grad_norm": "max_grad_norm",
+    "n_steps": "trajectory_length",
+    "n_epochs": "epochs_per_update",
+    "hidden_size": "hidden_size",
+    "epochs_per_update": "epochs_per_update",
+}
+
 TASK_TO_ENV_ID = {
     "hover": "PyFlyt/QuadX-Hover-v4",
     "waypoints": "PyFlyt/QuadX-Waypoints-v4",
 }
 
 
-def load_config(config_path: Path) -> tuple[str, str, str, dict]:
-    """Load a config YAML and return (algo, task, env_id, hyperparams_dict).
+def load_config(config_path: Path) -> tuple[str, str, str, dict, str | None]:
+    """Load a config YAML and return (algo, task, env_id, hyperparams_dict, impl_path).
 
-    The YAML has a `_meta` block with `algo` and `task` keys, plus one key
-    per env ID containing the rl_zoo3 hyperparameters.  The `_meta` block is
+    The YAML has a `_meta` block with `algo`, `task`, and optionally `impl` keys,
+    plus one key per env ID containing the hyperparameters.  The `_meta` block is
     stripped before the hyperparams dict is returned.
+
+    When `_meta.impl` is set, `impl_path` is the path to a custom Python
+    implementation module; rl_zoo3 is bypassed and train_model() is called directly.
     """
     with open(config_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
@@ -46,6 +71,7 @@ def load_config(config_path: Path) -> tuple[str, str, str, dict]:
     meta = raw.pop("_meta", {})
     algo = meta.get("algo")
     task = meta.get("task")
+    impl_path = meta.get("impl")  # optional: path to custom Python module
 
     if not algo or not task:
         raise ValueError(
@@ -61,7 +87,77 @@ def load_config(config_path: Path) -> tuple[str, str, str, dict]:
             f"{config_path}: expected a '{env_id}' key for task '{task}', but it was not found."
         )
 
-    return algo, task, env_id, raw
+    return algo, task, env_id, raw, impl_path
+
+
+def _load_impl_module(impl_path: str):
+    """Dynamically import a Python implementation module from a file path."""
+    resolved = PROJECT_ROOT / impl_path
+    if not resolved.exists():
+        resolved = Path(impl_path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"Implementation module not found: {impl_path}")
+    spec = importlib.util.spec_from_file_location("_impl_module", resolved)
+    module = importlib.util.module_from_spec(spec)
+    # Make the project root importable inside the module
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_single_impl(
+    impl_path: str,
+    task: str,
+    env_id: str,
+    hyperparams: dict,
+    config_stem: str,
+    mode: int,
+    seed: int,
+    timesteps: int | None,
+    no_wandb: bool,
+) -> int:
+    """Route training to a custom Python implementation instead of rl_zoo3.
+
+    Reads hyperparameters from the YAML, maps SB3-style keys to the scratch
+    PPO convention, and calls module.train_model().
+    Returns 0 on success, 1 on failure.
+    """
+    module = _load_impl_module(impl_path)
+
+    env_block: dict = hyperparams.get(env_id, {})
+    num_timesteps = timesteps if timesteps is not None else int(env_block.get("n_timesteps", 500_000))
+
+    # Map SB3 YAML keys → scratch PPO hyperparams keys
+    hyperparams_override: dict = {}
+    for yaml_key, scratch_key in _SB3_TO_SCRATCH_KEY_MAP.items():
+        if yaml_key in env_block:
+            hyperparams_override[scratch_key] = env_block[yaml_key]
+
+    output_dir = str(
+        PROJECT_ROOT / "results" / "artifacts" / f"{config_stem}_mode{mode}_seed{seed}"
+    )
+
+    print(f"\n[train_zoo] {config_stem}  mode={mode}  seed={seed}  (custom impl: {impl_path})")
+    print(f"[train_zoo] hyperparams_override: {hyperparams_override}")
+    print(f"[train_zoo] output_dir: {output_dir}\n")
+
+    try:
+        module.train_model(
+            task=task,
+            flight_mode=mode,
+            seed=seed,
+            num_timesteps=num_timesteps,
+            log_to_wandb=not no_wandb,
+            output_dir=output_dir,
+            hyperparams_override=hyperparams_override,
+        )
+        return 0
+    except Exception as exc:
+        print(f"[train_zoo] EXCEPTION: {exc}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def build_rl_zoo_cmd(
@@ -211,14 +307,20 @@ def main():
 
     failures = []
     for config_path in config_paths:
-        algo, task, env_id, hyperparams = load_config(config_path)
+        algo, task, env_id, hyperparams, impl_path = load_config(config_path)
         config_stem = config_path.stem
         print(f"\n--- {config_stem}  ({algo} / {env_id}) ---")
         for mode, seed in itertools.product(modes, seeds):
-            rc = run_single(
-                algo, env_id, hyperparams, config_stem,
-                mode, seed, args.timesteps, args.no_wandb, args.device,
-            )
+            if impl_path:
+                rc = run_single_impl(
+                    impl_path, task, env_id, hyperparams, config_stem,
+                    mode, seed, args.timesteps, args.no_wandb,
+                )
+            else:
+                rc = run_single(
+                    algo, env_id, hyperparams, config_stem,
+                    mode, seed, args.timesteps, args.no_wandb, args.device,
+                )
             if rc != 0:
                 failures.append((config_stem, mode, seed, rc))
                 print(f"[train_zoo] FAILED  {config_stem}  mode={mode}  seed={seed}  exit={rc}")

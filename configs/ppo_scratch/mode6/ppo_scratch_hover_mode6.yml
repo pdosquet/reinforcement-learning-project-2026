@@ -1,0 +1,17 @@
+_meta:
+   algo: ppo_scratch
+   task: hover # PyFlyt/QuadX-Hover-v4
+   impl: implementations/ppo_implementation.py
+
+PyFlyt/QuadX-Hover-v4:
+   n_timesteps: !!float 5e5
+   learning_rate: 3.0e-4
+   n_steps: 4096 # ns=4096 is step-efficient on mode 6
+   gamma: 0.98
+   gae_lambda: 0.95
+   clip_range: 0.2
+   ent_coef: 0.01
+   vf_coef: 0.5
+   max_grad_norm: 0.5
+   hidden_size: 64
+   n_epochs: 10

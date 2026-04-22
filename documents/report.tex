@@ -1,0 +1,618 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+% Define code style
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!5},
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black}
+}
+
+\title{INFO0085-1 Compilers - Implementing a VSOP Compiler}
+\author{Van de Vyver Eri}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{MDP Formalization}
+
+\subsection{QuadX-Hover-v4 - Stabilisation Task}
+
+MDP Formalisation
+\begin{itemize}
+  \item \textbf{State space} $\mathcal{S}$: continuous vector $s \in \mathbb{R}^{21}$ containing
+    quaternion orientation, angular velocities, linear velocities, and position relative to the
+    target hover point.
+  \item \textbf{Action space} $\mathcal{A}$: continuous $a \in [-1,1]^4$; semantics depend on
+    the flight mode (see Table~\ref{tab:flight_modes}).
+  \item \textbf{Transition model}: physics simulation via PyBullet at 120\,Hz, with a 30\,Hz
+    policy frequency.
+  \item \textbf{Reward function}: dense reward proportional to distance from target position
+    and orientation deviation; a large negative penalty on crash.
+    Formally, at each step:
+    \[
+      r_t = -\|\mathbf{p}_t - \mathbf{p}^*\|_2 - \lambda_\omega \|\boldsymbol{\omega}_t\|_2 + r_{\text{crash}} \cdot \mathbf{1}[\text{crash}]
+    \]
+    where $\mathbf{p}^*$ is the target position and $r_{\text{crash}} \ll 0$.
+  \item \textbf{Episode termination}: crash (out of bounds or excessive tilt) or timeout after
+    500 steps.
+  \item \textbf{Discount factor}: $\gamma \in \{0.98, 0.99\}$ explored.
+\end{itemize}
+
+Observation exploration
+
+% TODO Add obs/reward distribution plots from environment exploration (histogram of reward per step for random policy, obs mean/std per component).
+
+\subsection{QuadX-Waypoints-v4 -- Navigation Task}
+
+MDP formalization:
+\begin{itemize}
+  \item \textbf{State space}: Dict observation $\{\texttt{attitude}: \mathbb{R}^{21},\;
+    \texttt{target\_deltas}: \mathbb{R}^{N\times 3}\}$ where $N$ decreases as waypoints are
+    reached.  After wrapping with \texttt{FlattenWaypointEnv} (padding to
+    \texttt{max\_waypoints}$=4$), the effective state is $s \in \mathbb{R}^{33}$.
+  \item \textbf{Action space}: same as hover, $a\in[-1,1]^4$.
+  \item \textbf{Reward}: sparse waypoint-reach bonus when $\|\mathbf{p}_t - \mathbf{w}_k\|_2 <
+    4.0$\,m, plus a step-wise survival penalty.  With \texttt{WaypointDistanceShaping}:
+    \[
+      r_t^{\text{shaped}} = r_t + \underbrace{[-\alpha\|\mathbf{w}_k - \mathbf{p}_{t}\|_2] - [-\alpha\|\mathbf{w}_k - \mathbf{p}_{t-1}\|_2]}_{\phi(s_{t}) - \phi(s_{t-1})}
+    \]
+    guaranteeing policy-invariance by Ng et al.'s shaping theorem.
+  \item \textbf{Episode termination}: crash or timeout after 2000 steps ($\approx$120\,s).
+  \item \textbf{Environment kwargs} (overriding restrictive defaults):
+    \texttt{goal\_reach\_distance=4.0}, \texttt{flight\_dome\_size=150.0},
+    \texttt{max\_duration\_seconds=120.0}, \texttt{num\_targets=4}.
+\end{itemize}
+
+\paragraph{Observation exploration.}
+% TODO Add obs/reward distribution plots; waypoint distance histogram at episode start
+
+\subsection{Dogfight -- MAFixedwingDogfightEnvV2}
+
+MDP formalization:
+\begin{itemize}
+  \item \textbf{Environment}: PettingZoo \texttt{ParallelEnv}, 1v1 fixed-wing combat.
+    Wrapped as single-agent Gymnasium env via \texttt{DogfightSelfPlayEnv}.
+  \item \textbf{State space}: $s \in \mathbb{R}^{37}$ (flattened, \texttt{assisted\_flight=True}).
+    Contains own orientation, velocity, angular rate, and relative state of the opponent.
+  \item \textbf{Action space}: $a \in [-1,1]^4$ --- roll, pitch, yaw, throttle commands.
+  \item \textbf{Reward}: positive for scoring hits (opponent HP reduced), negative for being hit.
+    Sparse: reward only triggers on hit events.
+  \item \textbf{Episode termination}: one agent destroyed, or 60\,s timeout at 30\,Hz.
+\end{itemize}
+
+\section{Algorithms Used}
+
+We train and compare two families of algorithms: Proximal Policy Optimization (PPO) and
+Soft Actor-Critic (SAC), both from the Stable-Baselines3 library \cite{sb3} via RL Zoo 3,
+plus a fully hand-written PPO implementation for the hover task to see if we can reach similar behaviour.
+
+\subsection{Proximal Policy Optimization (PPO)}
+
+PPO is an on-policy actor-critic algorithm.
+
+At each iteration, a batch of environment interactions (a rollout) is collected under
+the current policy $\pi_\theta$.  The policy is then updated by maximising the clipped
+surrogate objective:
+\[
+  \mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}_t\!\left[
+    \min\!\bigl(r_t(\theta)\hat{A}_t,\;
+    \text{clip}(r_t(\theta), 1-\varepsilon, 1+\varepsilon)\hat{A}_t\bigr)
+  \right], \quad r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}
+\]
+where $\hat{A}_t$ is the Generalised Advantage Estimate (GAE):
+\[
+  \hat{A}_t = \sum_{l=0}^{\infty}(\gamma\lambda)^l \delta_{t+l}, \qquad
+  \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+\]
+
+Key properties:
+\begin{itemize}
+  \item \textbf{On-policy}: each batch is discarded after the update, preventing stale gradient
+    issues but requiring many environment interactions.
+  \item \textbf{Sample efficiency}: moderate; improved via multiple epochs over the same rollout.
+  \item \textbf{Exploration}: entropy bonus $-\beta H(\pi_\theta)$ added to objective; the stochastic
+    Gaussian policy provides inherent exploration.
+  \item \textbf{Stability}: clipping prevents destructively large updates.
+\end{itemize}
+
+\paragraph{Scratch implementation (\texttt{ppo\_implementation.py}) \\\\} 
+
+We implement PPO from scratch as a PyTorch module to deepen understanding:
+\begin{itemize}[nosep]
+  \item \texttt{ActorNetwork}: 2-layer MLP ($\tanh$ activations), Gaussian head with learned
+    log-std parameter (not state-dependent).
+  \item \texttt{CriticNetwork}: 2-layer MLP value function.
+  \item \texttt{PPOAgent}: GAE, clipped surrogate, separate actor/critic Adam optimisers,
+    gradient norm clipping, entropy bonus.
+  \item \texttt{PPOTrainer}: trajectory collection loop; periodic evaluation and checkpoint saving.
+\end{itemize}
+
+\subsection{Scratch PPO Design Decisions}
+
+
+\begin{itemize}
+  \item \textbf{Separate actor/critic optimisers} with learning rate $\alpha_c = \alpha_a / 2$:
+    the critic updates faster to provide accurate baselines.
+  \item \textbf{Batch size = full trajectory}: easier to implement and sufficient for the
+    trajectory lengths used ($n_s \leq 4096$).  A future improvement is mini-batch SGD.
+  \item \textbf{Log-std parameter} (not state-dependent): keeps the Gaussian policy
+    consistent with SB3 PPO for fair comparison; removes conditional variance instability.
+  \item \textbf{\texttt{hyperparams\_override} interface}: allows YAML configs in
+    \texttt{configs/ppo\_scratch/} to override any hyperparameter via \texttt{train\_zoo.py},
+    matching the Zoo/SB3 workflow exactly.
+\end{itemize}
+
+\paragraph{SB3 / Zoo PPO \\}
+
+We also train SB3 PPO via RL Zoo 3 using YAML hyperparameter configs.  This serves as a
+stronger baseline with a well-tuned implementation (mini-batches, shared MLP backbone,
+\texttt{VecNormalize} available).
+
+\paragraph{Choice reason}
+Hover and waypoints are dense-to-sparse reward tasks with continuous actions and moderate
+episode length.  PPO's on-policy nature means it never suffers from value overestimation
+on unseen states, and its clipping gives stable learning when the reward landscape changes
+abruptly (e.g., on first achieving hover stability).
+
+\subsection{Soft Actor-Critic (SAC)}
+
+SAC is an off-policy maximum-entropy actor-critic algorithm.
+
+SAC augments the standard RL objective with an entropy term:
+\[
+  J(\pi) = \sum_t \mathbb{E}_{(s_t,a_t)\sim\rho_\pi}\!\left[r(s_t,a_t) + \alpha H(\pi(\cdot|s_t))\right]
+\]
+where $\alpha$ is automatically tuned.  The critic learns a soft Q-function via Bellman
+backup, and the policy is updated by minimising:
+\[
+  J_\pi(\phi) = \mathbb{E}_{s_t\sim\mathcal{D}}\!\left[\mathbb{E}_{a_t\sim\pi_\phi}[\alpha\log\pi_\phi(a_t|s_t) - Q_\psi(s_t,a_t)]\right]
+\]
+
+Key properties:
+\begin{itemize}
+  \item \textbf{Off-policy}: uses a replay buffer, making it highly \textbf{sample-efficient}.
+  \item \textbf{Update-to-Data (UTD) ratio}: controls how many gradient steps are taken per
+    environment step.  Higher UTD $>1$ improves sample efficiency at the cost of compute.
+  \item \textbf{Exploration}: automatic entropy tuning adapts the stochasticity throughout
+    training.
+  \item \textbf{Stability}: double-Q critics with target networks prevent overestimation.
+\end{itemize}
+
+\paragraph{Choice reason}
+SAC's off-policy replay makes it far more sample-efficient than PPO on continuous-action tasks,
+which is especially relevant given compute constraints.  The automatic entropy tuning is
+valuable because the optimal exploration level differs between hover (relatively easy once
+stable) and waypoints (requires persistent exploration to discover sparse waypoint rewards).
+
+% ----------------------------------------------------------------
+\subsection{Algorithm Summary}
+% ----------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+\textbf{Algorithm} & \textbf{Policy type} & \textbf{Data reuse} & \textbf{Main advantage here} \\
+\midrule
+PPO (scratch) & On-policy, stochastic & None (on-policy) & Full understanding; reproducibility \\
+PPO (SB3/Zoo) & On-policy, stochastic & None & Well-tuned; mini-batch; ablation reference \\
+SAC (SB3/Zoo) & Off-policy, stochastic & Replay buffer & Sample efficiency; auto entropy tuning \\
+PPO dogfight  & On-policy, stochastic & None & Self-play stability; SB3 for fast iteration \\
+\bottomrule
+\end{tabularx}
+\caption{Algorithm comparison.}
+\end{table}
+
+\section{Results}
+
+All runs logged to Weights \& Biases (project: \texttt{pyflyt-rl}).
+Evaluation: deterministic policy, 20 episodes, fixed seeds.
+
+% ----------------------------------------------------------------
+\subsection{PPO on Hover}
+% ----------------------------------------------------------------
+
+\subsubsection{Mode 0 -- Pilot sweep (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Config & $\gamma$ & $n_\text{steps}$ & Seed 0 & Seed 1 \\
+\midrule
+\texttt{g098\_ns2048} & 0.98 & 2048 & converged & converged \\
+\texttt{g098\_ns4096} & 0.98 & 4096 & no convergence & no convergence \\
+\texttt{g099\_ns2048} & 0.99 & 2048 & converged & slower \\
+\texttt{g099\_ns4096} & 0.99 & 4096 & no convergence & no convergence \\
+\bottomrule
+\end{tabular}
+\caption{PPO hover mode 0 at 100k steps.  $n_s=4096$ gets only $\sim$24 update cycles
+vs $\sim$48 for $n_s=2048$ within budget.}
+\label{tab:ppo_hover_mode0_100k}
+\end{table}
+
+\subsubsection{Mode 0 -- Extended runs (500k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccl}
+\toprule
+Config & $\gamma$ & Plateau \texttt{ep\_rew\_mean} & Notes \\
+\midrule
+\texttt{g098\_ns2048\_500k} & 0.98 & $\approx 1100$ & Faster convergence to plateau \\
+\texttt{g099\_ns2048\_500k} & 0.99 & $\approx 1100$ & Higher early reward, slower final convergence \\
+\bottomrule
+\end{tabular}
+\caption{PPO hover mode 0 at 500k steps.  Both configs reach the same plateau; $\gamma=0.98$
+preferred for speed.}
+\label{tab:ppo_hover_mode0_500k}
+\end{table}
+
+\TODO{Add W\&B learning curve plots (ep\_rew\_mean vs steps) for both configs on both seeds.}
+\TODO{Add final deterministic eval table: mean $\pm$ std over 20 episodes, all (config, seed) pairs.}
+
+\subsubsection{Mode 6 -- Pilot sweep (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccll}
+\toprule
+Config & $\gamma$ & $n_s$ & ep\_rew\_mean & Verdict \\
+\midrule
+\texttt{g098\_ns2048} & 0.98 & 2048 & collapses at end & unstable \\
+\texttt{g098\_ns4096} & 0.98 & 4096 & plateau (faster) & stable \\
+\texttt{g099\_ns2048} & 0.99 & 2048 & plateau (slow) & stable \\
+\texttt{g099\_ns4096} & 0.99 & 4096 & plateau (faster) & stable \\
+\bottomrule
+\end{tabular}
+\caption{PPO hover mode 6 at 100k.  On mode 6, $n_s=4096$ is more step-efficient;
+$\gamma=0.98$ with $n_s=2048$ collapses.}
+\end{table}
+
+\subsubsection{Mode 6 -- Extended runs (500k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccl}
+\toprule
+Config & Plateau & Convergence speed & Rank \\
+\midrule
+\texttt{g098\_ns4096} & $\approx 1100$ & Fastest & 1 \\
+\texttt{g099\_ns4096} & $\approx 1100$ & Intermediate & 2 \\
+\texttt{g098\_ns2048} & $\approx 1100$ & Intermediate & 3 \\
+\texttt{g099\_ns2048} & $\approx 1100$ & Slowest & 4 \\
+\bottomrule
+\end{tabular}
+\caption{PPO hover mode 6 at 500k.  All four configs converge to same plateau; $n_s=4096$
+with $\gamma=0.98$ is most step-efficient on mode 6.}
+\end{table}
+
+\TODO{Add eval reward mean $\pm$ std for each config (deterministic, 20 episodes).}
+
+% ----------------------------------------------------------------
+\subsection{SAC on Hover}
+% ----------------------------------------------------------------
+
+\subsubsection{Mode 0 -- First sweep (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccl}
+\toprule
+Config & $\gamma$ & UTD & Result \\
+\midrule
+\texttt{g098\_utd3} & 0.98 & 3 & $\approx 1100$ (converged) \\
+\texttt{g098\_utd4} & 0.98 & 4 & $\approx 1100$ (converged) \\
+\texttt{g099\_utd3} & 0.99 & 3 & Not reached within 100k \\
+\texttt{g099\_utd4} & 0.99 & 4 & Not reached within 100k \\
+\bottomrule
+\end{tabular}
+\caption{SAC hover mode 0 at 100k.  $\gamma=0.98$ converges within budget;
+$\gamma=0.99$ struggles with unstable entropy tuning.}
+\end{table}
+
+\subsubsection{Mode 6 -- First sweep (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccl}
+\toprule
+Config & $\gamma$ & UTD & Convergence speed & Actor loss \\
+\midrule
+\texttt{g098\_utd3} & 0.98 & 3 & Slower & Higher \\
+\texttt{g098\_utd4} & 0.98 & 4 & Slower & Higher \\
+\texttt{g099\_utd3} & 0.99 & 3 & Faster & Lower \\
+\texttt{g099\_utd4} & 0.99 & 4 & Faster & Lower \\
+\bottomrule
+\end{tabular}
+\caption{SAC hover mode 6 at 100k.  All configs reach the same plateau;
+$\gamma=0.99$ preferred (faster, lower actor loss).}
+\end{table}
+
+\TODO{Add eval mean $\pm$ std for best SAC hover configs across seeds.}
+
+% ----------------------------------------------------------------
+\subsection{SAC on Waypoints (Mode 6)}
+% ----------------------------------------------------------------
+
+\subsubsection{First sweep -- unshapped (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccccl}
+\toprule
+Run & UTD & Seed & Train mean $\pm$ std & Best 10k window & Eval (det.) \\
+\midrule
+UTD2 s0 & 2 & 0 & $-317.6 \pm 145.9$ & $-211.8$ (50k) & $-97.7 \pm 2.5$ \\
+UTD2 s1 & 2 & 1 & $-364.8 \pm 144.7$ & $-263.2$ (30k) & $-91.8 \pm 22.1$ \\
+UTD3 s0 & 3 & 0 & $-408.7 \pm 156.3$ & $-297.3$ (70k) & $-98.2 \pm 3.0$ \\
+\bottomrule
+\end{tabular}
+\caption{SAC waypoints mode 6, 100k, no reward shaping.  Agent learns crash avoidance
+($r_\text{crash}\approx -600 \to -90$) but never discovers a waypoint.}
+\label{tab:sac_waypoints_100k}
+\end{table}
+
+\subsubsection{With reward shaping (100k steps)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccl}
+\toprule
+Run & Seed & Final eval & Best eval & Ep.\ len (eval) \\
+\midrule
+SAC + shaping (UTD2) & 0 & $-90.3$ & $-89.4$ & 48 \\
+SAC + shaping (UTD2) & 1 & $-98.2$ & $-90.8$ & 15 \\
+\bottomrule
+\end{tabular}
+\caption{SAC waypoints mode 6 + \texttt{WaypointDistanceShaping} (coef=0.01) at 100k.
+Marginal improvement over unshapped baseline; plateau unbroken.}
+\end{table}
+
+\TODO{Add SAC waypoints 500k-1M results once available.}
+
+% ----------------------------------------------------------------
+\subsection{PPO on Waypoints (Mode 6) -- Reward Shaping Ablation}
+% ----------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccccc}
+\toprule
+Zoo run & Config & Steps & $\alpha_\text{ent}$ & $\alpha_\text{shape}$ & Final eval & Best eval \\
+\midrule
+\_1 & baseline s0 & 100k & 0.01 & 0.01 & $-92.1$ & $-81.5$ \\
+\_2 & baseline s1 & 100k & 0.01 & 0.01 & $-97.0$ & $-96.5$ \\
+\_3 & baseline s0 & 500k & 0.01 & 0.01 & $-91.3$ & $-80.5$ \\
+\_4 & baseline s1 & 500k & 0.01 & 0.01 & $-94.5$ & $-76.8$ \\
+\_5 & ent005 s0   & 500k & 0.05 & 0.05 & $-98.6$ & $-77.8$ \\
+\_6 & ent005 s1   & 500k & 0.05 & 0.05 & $-98.4$ & $-88.7$ \\
+\_7 & ent001\_shaping02 s0 & 500k & 0.01 & 0.20 & $-90.9$ & $-82.5$ \\
+\_8 & ent001\_shaping02 s1 & 300k & 0.01 & 0.20 & $-93.4$ & $-79.8$ \\
+\bottomrule
+\end{tabular}
+\caption{PPO waypoints mode 6 shaping ablation.  Best configuration so far:
+$\alpha_\text{ent}=0.01$, $\alpha_\text{shape}=0.20$.}
+\label{tab:ppo_waypoints_ablation}
+\end{table}
+
+\TODO{Add learning curves for runs \_7, \_8 (shaped) vs \_3, \_4 (baseline).}
+\TODO{Add waypoints breakthrough results (requires 1M+ steps or curriculum).}
+
+% ----------------------------------------------------------------
+\subsection{Scratch PPO vs SB3 PPO on Hover}
+% ----------------------------------------------------------------
+
+\TODO{Run scratch PPO via \texttt{train\_zoo.py --config configs/ppo\_scratch/ppo\_scratch\_hover\_mode0.yml}
+and fill in comparative table (eval mean, convergence speed, runtime per update).}
+
+\section{Analysis \& Discussion}
+\label{sec:analysis}
+
+% ----------------------------------------------------------------
+\subsection{PPO vs SAC on Hover}
+% ----------------------------------------------------------------
+
+Both PPO and SAC converge to the same reward (around 1100) on the hover task. The main practical differences are:
+
+\begin{itemize}
+  \item \textbf{Sample efficiency.}  SAC ($\gamma=0.98$, UTD=3) reaches the plateau within
+    100k steps, while PPO ($\gamma=0.98$, $n_s=2048$) typically needs 200--300k before
+    fully converging at 500k.  The replay buffer allows SAC to reuse each transition
+    $\approx3$ times.
+
+  \item \textbf{Stability.}  PPO with $n_s=4096$ is more step-efficient on mode 6 but
+    PPO with $n_s=2048$ and $\gamma=0.98$ collapses at 100k (insufficient rollout length
+    leads to high-variance GAE estimates with a short-horizon discount).  SAC with
+    $\gamma=0.99$ on mode 6 converges \emph{faster} than $\gamma=0.98$ --- opposite to
+    mode 0 --- because mode 6's smooth velocity controller reduces observation variance and
+    makes the longer discount horizon beneficial.
+
+  \item \textbf{Hyperparameter sensitivity.}  SAC is more sensitive to $\gamma$ on mode 0:
+    $\gamma=0.99$ fails to converge within 100k due to unstable entropy coefficient
+    optimisation.  PPO is more sensitive to $n_s$ and is noisier (single trajectory).
+\end{itemize}
+
+\TODO{Add quantitative comparison table: eval mean $\pm$ std, IQM across seeds,
+  for best PPO and SAC configs on hover mode 0 and mode 6.}
+
+\subsection{Effect of Flight Mode on Waypoint Performance}
+
+Mode 0 is harder than mode 6 because it exposes angular velocity + thrust commands. To move, the agent must
+first tilt the drone (pitch/roll), stabilise, and then be horizontal again. This require many movements for the drone to learn. Any policy that has not learned precise attitude control will crash before accumulating any navigation reward. \\
+
+Mode 6 exposes ground-frame velocity commands directly.  Moving from a point to another is a one-step command and the PID cascade handles the underlying attitude. This enables to learn faster how to get a higher reward. \\
+
+All waypoints experiments that run on mode 6 performed better because mode 0 adds an extra layer of
+difficulty on top of the navigation reward learning. Mode 0 waypoints would likely require curriculum learning: first learn hover at mode 0, then navigate at mode 6, then navigate at mode 0. \\
+
+% TODO Add more explanations at the end if waypoints has succeeded
+
+\subsection{Failure Analysis}
+
+The waypoints task exhibits a characteristic two-phase failure:
+
+\begin{enumerate}
+  \item \textbf{Phase 1 (0--20k steps):} Random / early policy crashes frequently
+    ($r \approx -600$ per episode).
+  \item \textbf{Phase 2 (20k--500k steps):} Agent learns \emph{crash avoidance} --- it
+    stays airborne and drifts, accumulating a survival reward ($r \approx -90$).  The
+    training curve \texttt{ep\_rew\_mean} rises from $-600$ to $-300$, then
+    \textbf{plateaus completely}.
+\end{enumerate}
+
+\textbf{Root cause: sparse reward.}  In a 150\,m dome with a 4\,m goal radius, the
+probability of a random trajectory hitting a waypoint is negligible.  The agent maximises
+its current reward signal (crash avoidance) but never receives the waypoint signal.
+This is a classic \emph{deceptive local optimum} under sparse reward.
+
+\textbf{Effect of reward shaping.}  Adding \texttt{WaypointDistanceShaping} with
+$\alpha_\text{shape}=0.20$ creates a positive gradient pointing toward the next waypoint.
+Runs \_7 and \_8 in Table~\ref{tab:ppo_waypoints_ablation} show higher deterministic
+episode lengths (45--46 vs 20--42) suggesting the policy is moving toward waypoints, but the
+4\,m goal radius is still not reliably entered in 500k steps.
+
+\textbf{High entropy trap.}  With $\alpha_\text{ent}=0.05$, the stochastic policy stays
+airborne for full 3600-step episodes during training (high variance keeps it up).  But the
+deterministic evaluation policy immediately crashes (the learned action \emph{mean} is
+useless --- it has learned to survive through variance, not through skill).
+
+\textbf{What we would do with more compute.}
+\begin{itemize}[nosep]
+  \item Run SAC at 1M steps with shaping ($\alpha=0.20$) to determine the minimum budget.
+  \item Curriculum: start with \texttt{flight\_dome\_size=30}, \texttt{goal\_reach\_distance=8},
+    1 waypoint; increase difficulty gradually.
+  \item Potential-based shaping with decaying coefficient to avoid the entropy trap at
+    end of training.
+\end{itemize}
+
+% ----------------------------------------------------------------
+\subsection{Failure Analysis: PPO Policy Collapse (Mode 6, $\gamma=0.98$)}
+% ----------------------------------------------------------------
+
+At 100k steps, \texttt{g098\_ns2048} on mode 6 showed reward collapse near the end of
+training.  Hypothesis: $\gamma=0.98$ corresponds to an effective horizon of
+$1/(1-\gamma)=50$ steps.  With $n_s=2048$ steps per rollout, each update covers $\sim 40$
+effective horizons.  However, mode 6 requires the agent to maintain hover for hundreds of
+steps; a 50-step horizon cannot assign credit to long-range stability actions.  At 500k
+this issue disappears --- with more data, the value function eventually generalises despite
+the short horizon.
+
+\TODO{Quantify with clip fraction, explained variance, and value loss curves.}
+
+% ----------------------------------------------------------------
+\subsection{Experiment Reproducibility}
+% ----------------------------------------------------------------
+
+\begin{itemize}[nosep]
+  \item All runs seeded (\texttt{--seed} flag); Gymnasium \texttt{env.reset(seed=...)} called.
+  \item Hyperparameters stored in \texttt{results/artifacts/.../metadata.json} and in
+    W\&B run config.
+  \item YAML configs under version control; no manual hyperparameter editing between runs.
+  \item Eval always uses 20 deterministic episodes at fixed seeds $\{100, 101, \ldots, 119\}$.
+\end{itemize}
+
+% ----------------------------------------------------------------
+\subsection{Weights \& Biases Integration}
+% ----------------------------------------------------------------
+
+\begin{itemize}[nosep]
+  \item SB3 runs: rl\_zoo3 \texttt{--track} flag passes metrics to W\&B automatically.
+  \item Scratch PPO: custom \texttt{model\_utils.init\_wandb\_run} / \texttt{log\_wandb};
+    logs actor loss, critic loss, entropy, clip fraction, and eval reward per update.
+  \item W\&B project: \texttt{pyflyt-rl}.  Runs grouped by config stem and tagged with
+    algo, mode, seed.
+\end{itemize}
+
+\section{Dogfight Tournament Strategy}
+
+% Temporary
+
+We train \texttt{implementations/dogfight\_ppo.py}, a PPO agent in
+\texttt{DogfightSelfPlayEnv}.
+
+The opponent policy is initialised to random.  Every 50000 environment steps, the current policy is frozen and replaces the
+opponent. This creates a curriculum: the agent faces an increasingly competent opponent, preventing overfitting to a fixed strategy while maintaining stable gradient estimates.
+
+\paragraph{Network architecture.}
+2-layer MLP $[256, 256]$ with ReLU activations, SB3 \texttt{MlpPolicy}.
+
+\paragraph{Training command.}
+\begin{lstlisting}[language=bash, numbers=none]
+python train_dogfight.py --seed 0 --timesteps 1000000 --no-wandb
+\end{lstlisting}
+Produces:
+\begin{itemize}[nosep]
+  \item \texttt{results/dogfight/dogfight\_ppo\_seed0.zip}
+  \item \texttt{submissions/group\_dogfight.py} (auto-generated, tournament-ready)
+\end{itemize}
+
+\paragraph{Submission verification.}
+\begin{lstlisting}[language=bash, numbers=none]
+python -c "from submissions.group_dogfight import load_model; print(load_model())"
+python scripts/tournament.py submissions/
+\end{lstlisting}
+
+\subsection{Results}
+
+\TODO{Fill in after running \texttt{train\_dogfight.py} and the local tournament:
+  Elo rating after $K$ rounds, win rate vs random baseline, vs previous self-play
+  checkpoints.}
+
+\TODO{Describe qualitative behaviour of the trained agent (aggressive approach,
+  evasive manoeuvres, circling strategy, etc.)}
+
+
+\section{}
+\label{sec:bonus}
+
+\subsection{Reward Shaping (Implemented)}
+
+We implemented and ablated \textbf{potential-based reward shaping} for the waypoints task:
+\begin{itemize}[nosep]
+  \item \texttt{WaypointDistanceShaping}: $\phi(s) = -\alpha \|\mathbf{w}_\text{next} - \mathbf{p}\|$
+  \item \texttt{WaypointSumDistanceShaping}: $\phi(s) = -\alpha \sum_k \|\mathbf{w}_k - \mathbf{p}\|$
+\end{itemize}
+The ablation (Table~\ref{tab:ppo_waypoints_ablation}) isolates the effect of shaping
+coefficient and entropy coefficient, demonstrating that $\alpha_\text{shape}=0.20$ with
+$\alpha_\text{ent}=0.01$ is the best configuration found in 500k steps.
+
+\subsection{Hyperparameter Ablation (Implemented)}
+
+We systematically varied $\gamma \in \{0.98, 0.99\}$, $n_\text{steps} \in \{2048, 4096\}$
+for PPO and $\gamma \in \{0.98, 0.99\}$, UTD $\in \{3, 4\}$ for SAC, each at two budget
+levels (100k and 500k).  The ablations revealed mode-dependent optima:
+$\gamma=0.98$ on mode 0 (short-horizon tasks), $\gamma=0.99$ on mode 6 (longer stability
+requirements).
+
+\subsection{From-Scratch PPO (Implemented)}
+
+Implementing PPO in raw PyTorch without library abstractions demonstrates understanding of
+the full algorithm.  It additionally provides a sanity check against SB3: if both converge
+to the same plateau, our understanding of the algorithm is sound.
+
+\subsection{Self-Play Dogfight (Implemented)}
+
+The self-play curriculum in \texttt{train\_dogfight.py} is a non-trivial innovation: it
+uses periodic opponent snapshots to avoid catastrophic forgetting of how to beat earlier
+policy versions while progressively increasing difficulty.
+
+\subsection{Planned (Not Yet Done)}
+
+\TODO{Curriculum learning for waypoints: staged difficulty increase.}
+\TODO{Vectorised environments to multiply scratch PPO sample throughput.}
+\TODO{IQM / stratified bootstrap confidence intervals (Agarwal et al.) for all final comparisons.}
+
+\end{document}

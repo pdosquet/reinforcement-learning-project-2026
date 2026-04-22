@@ -63,8 +63,17 @@ class DogfightSelfPlayEnv(gymnasium.Env):
         if self.opponent_policy is not None:
             action, _ = self.opponent_policy.predict(obs, deterministic=False)
             return action
-        else:
-            return self.action_space.sample()
+
+        action = np.zeros(self.action_space.shape, dtype=np.float32)
+        if action.shape == (4,):
+            # Heuristic "stable" opponent: straight-and-level with enough throttle.
+            # This is intentionally simple but avoids immediate stalls / crashes,
+            # making early-stage learning less degenerate than vs random actions.
+            action[0] = 0.0   # roll
+            action[1] = 0.05  # pitch slightly up
+            action[2] = 0.0   # yaw
+            action[3] = 0.65  # throttle
+        return action
 
     def reset(self, seed=None, options=None):
         # Try reset; if pybullet disconnected, recreate the env
