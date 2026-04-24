@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-import sys
 from pathlib import Path
 
+import gymnasium
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,22 +13,142 @@ import torch.optim as optim
 from torch.distributions import Normal
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Task episode limits for evaluation
+TASK_EPISODE_LIMITS = {
+    "hover": 500,
+    "waypoints": 2000,
+}
 
-from implementations.model_utils import (
-    TASK_EPISODE_LIMITS,
-    ObservationCheckedModel,
-    create_env,
-    evaluate_policy,
-    finish_wandb,
-    force_flight_mode,
-    init_wandb_run,
-    log_wandb,
-    load_artifact_metadata,
-    resolve_checkpoint_path,
-)
+
+def create_env(task: str, flight_mode: int, render: bool = False):
+    """Create the PyFlyt environment used by training and evaluation."""
+    render_mode = "human" if render else None
+
+    if task == "hover":
+        return gymnasium.make(
+            "PyFlyt/QuadX-Hover-v4",
+            flight_mode=flight_mode,
+            render_mode=render_mode,
+        )
+    if task == "waypoints":
+        return gymnasium.make(
+            "PyFlyt/QuadX-Waypoints-v4",
+            flight_mode=flight_mode,
+            render_mode=render_mode,
+        )
+    raise ValueError(f"Unknown task: {task}")
+
+
+def evaluate_policy(model, env, max_episode_length, n_episodes=5, deterministic=True):
+    """Run a few episodes and return compact evaluation statistics."""
+    rewards = []
+    lengths = []
+
+    for episode_idx in range(n_episodes):
+        obs, _ = env.reset(seed=100 + episode_idx)
+        total_reward = 0.0
+        steps = 0
+        done = False
+
+        while not done and steps < max_episode_length:
+            action, _ = model.predict(obs, deterministic=deterministic)
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            steps += 1
+            done = terminated or truncated
+
+        rewards.append(float(total_reward))
+        lengths.append(int(steps))
+
+    return {
+        "mean_reward": float(np.mean(rewards)),
+        "std_reward": float(np.std(rewards)),
+        "mean_length": float(np.mean(lengths)),
+    }
+
+
+class ObservationCheckedModel:
+    """Wrap a model and fail early when the observation dimension is wrong."""
+
+    def __init__(self, model, expected_obs_dim=None, task=None):
+        self.model = model
+        self.expected_obs_dim = expected_obs_dim
+        self.task = task
+
+    def predict(self, obs, deterministic=True):
+        if self.expected_obs_dim is not None:
+            observed_dim = int(np.asarray(obs).shape[-1])
+            if observed_dim != self.expected_obs_dim:
+                task_hint = f" trained for '{self.task}'" if self.task else ""
+                raise ValueError(
+                    f"Observation size mismatch: got {observed_dim}, expected {self.expected_obs_dim}. "
+                    f"This checkpoint was{task_hint}. "
+                    "Use the generated results/models/*.py file that matches the environment."
+                )
+        return self.model.predict(obs, deterministic=deterministic)
+
+
+def force_flight_mode(flight_mode: int):
+    """Patch gymnasium.make so evaluate.py creates the environment with the saved mode."""
+    original_make = gymnasium.make
+
+    def patched_make(env_id, *args, **kwargs):
+        kwargs["flight_mode"] = flight_mode
+        return original_make(env_id, *args, **kwargs)
+
+    gymnasium.make = patched_make
+
+
+def load_artifact_metadata(artifact_dir: Path):
+    """Load artifact metadata from JSON file if it exists."""
+    metadata_path = artifact_dir / "metadata.json"
+    if metadata_path.exists():
+        import json
+        with open(metadata_path, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def resolve_checkpoint_path(artifact_dir: Path, metadata: dict, default_name: str = "checkpoint.pt"):
+    """Resolve checkpoint path, preferring 'best_checkpoint.pt' if it exists."""
+    path = artifact_dir
+    best_checkpoint = path / "best_checkpoint.pt"
+    if best_checkpoint.exists():
+        return best_checkpoint
+    return path / metadata.get("checkpoint_file", default_name)
+
+
+# W&B logging utilities (compatible with train_zoo.py configuration)
+def init_wandb_run(enabled: bool, **kwargs):
+    """Initialize a W&B run only when logging is enabled."""
+    if not enabled:
+        return None
+    import os
+    os.environ.setdefault("WANDB__DISABLE_STATS", "true")
+    import wandb
+    return wandb.init(**kwargs)
+
+
+def log_wandb(enabled: bool, payload: dict, step=None):
+    """Log metrics to W&B when enabled."""
+    if not enabled:
+        return
+    import wandb
+    if step is None:
+        wandb.log(payload)
+    else:
+        wandb.log(payload, step=step)
+
+
+def finish_wandb(enabled: bool, summary=None):
+    """Finish a W&B run when enabled."""
+    if not enabled:
+        return
+    import wandb
+    if summary is not None:
+        if wandb.run is not None:
+            wandb.run.summary.update(summary)
+    wandb.finish()
 
 
 class ActorNetwork(nn.Module):

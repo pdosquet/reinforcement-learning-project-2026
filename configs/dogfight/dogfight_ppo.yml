@@ -1,0 +1,21 @@
+_meta:
+  algo: dogfight_ppo
+  task: dogfight
+  impl: implementations/dogfight_ppo.py
+
+dogfight:
+  n_timesteps: !!float 5e5
+  learning_rate: 3.0e-4
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  net_arch: [256, 256]
+  n_envs: 4
+  warmup_steps: 100000
+  opponent_update_freq: 50000

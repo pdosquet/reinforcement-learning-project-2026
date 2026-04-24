@@ -12,8 +12,6 @@ wandb/
 *.json
 !requirements.txt
 
-# Models
-*.zip
 
 # IDE
 .vscode/
