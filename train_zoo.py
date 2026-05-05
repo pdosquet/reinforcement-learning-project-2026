@@ -10,6 +10,7 @@ Single run (Zoo/SB3 algos):
     python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0
     python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0 --no-wandb
     python train_zoo.py --config configs/sac/mode0/sac_hover_g098_utd3_mode0.yml --mode 0 --seed 0 --timesteps 200000
+    python train_zoo.py --config configs/ppo/mode6/ppo_waypoints_curriculum_s2_nws_mode6.yml --mode 6 --seed 0 --trained-agent results/zoo/ppo/PyFlyt-QuadX-Waypoints-v4_15/PyFlyt-QuadX-Waypoints-v4/best_model.zip
 
 Single run (scratch PPO via _meta.impl):
     python train_zoo.py --config configs/ppo_scratch/ppo_scratch_hover_mode0.yml --mode 0 --seed 0
@@ -170,6 +171,7 @@ def build_rl_zoo_cmd(
     no_wandb: bool,
     config_stem: str,
     device: str,
+    trained_agent: str | None = None,
 ) -> tuple[list[str], Path]:
     """Build the rl_zoo3 subprocess command and a temp YAML with flight_mode injected.
 
@@ -212,6 +214,9 @@ def build_rl_zoo_cmd(
     if timesteps is not None:
         cmd += ["-n", str(timesteps)]
 
+    if trained_agent is not None:
+        cmd += ["--trained-agent", trained_agent]
+
     if not no_wandb:
         cmd += [
             "--track",
@@ -233,10 +238,12 @@ def run_single(
     timesteps: int | None,
     no_wandb: bool,
     device: str,
+    trained_agent: str | None = None,
 ) -> int:
     """Run one (mode, seed) training job. Returns the subprocess exit code."""
     cmd, tmp_path = build_rl_zoo_cmd(
-        algo, env_id, hyperparams, mode, seed, timesteps, no_wandb, config_stem, device
+        algo, env_id, hyperparams, mode, seed, timesteps, no_wandb, config_stem, device,
+        trained_agent=trained_agent,
     )
 
     # Make the project root importable so scripts.wrappers can be found by rl_zoo3
@@ -273,6 +280,8 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
     parser.add_argument("--device", default="cuda",
                         help="PyTorch device (default: cuda)")
+    parser.add_argument("--trained-agent", default=None,
+                        help="Path to a pre-trained model .zip to continue training from")
 
     # Single run vs sweep
     single = parser.add_argument_group("Single run")
@@ -320,6 +329,7 @@ def main():
                 rc = run_single(
                     algo, env_id, hyperparams, config_stem,
                     mode, seed, args.timesteps, args.no_wandb, args.device,
+                    trained_agent=args.trained_agent,
                 )
             if rc != 0:
                 failures.append((config_stem, mode, seed, rc))

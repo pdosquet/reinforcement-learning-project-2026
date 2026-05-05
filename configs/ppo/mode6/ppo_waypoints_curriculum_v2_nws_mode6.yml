@@ -24,4 +24,4 @@ PyFlyt/QuadX-Waypoints-v4:
     - scripts.wrappers.WaypointDistanceShaping:
         shaping_coef: 0.2
     - scripts.wrappers.FlattenWaypointEnv:
-        max_waypoints: 1
+        max_waypoints: 4

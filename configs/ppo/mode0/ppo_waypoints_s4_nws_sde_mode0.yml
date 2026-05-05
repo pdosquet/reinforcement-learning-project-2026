@@ -3,23 +3,26 @@ _meta:
   task: waypoints  # PyFlyt/QuadX-Waypoints-v4
 
 PyFlyt/QuadX-Waypoints-v4:
-  n_timesteps: !!float 5e5
+  n_timesteps: !!float 1e6
   policy: MlpPolicy
   learning_rate: lin_3e-4
-  n_steps: 2048
-  batch_size: 64
-  gamma: 0.99
-  gae_lambda: 0.98
+  n_steps: 4096
+  batch_size: 128
+  gamma: 0.995
+  gae_lambda: 0.95
   clip_range: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
   max_grad_norm: 0.5
-  policy_kwargs: "dict(net_arch=dict(pi=[64, 64], vf=[64, 64]))"
+  use_sde: True
+  sde_sample_freq: 4
+  normalize: True
+  policy_kwargs: "dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))"
   env_kwargs:
-    goal_reach_distance: 7.0
-    flight_dome_size: 50.0
+    goal_reach_distance: 4.0
+    flight_dome_size: 150.0
     max_duration_seconds: 120.0
-    num_targets: 2
+    num_targets: 4
   env_wrapper:
     - scripts.wrappers.WaypointDistanceShaping:
         shaping_coef: 0.2
